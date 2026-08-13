@@ -1,0 +1,8 @@
+# Parquet caches are rebuildable from the ingestion modules and are local state,
+# not repo artifacts. Hard rule 5 is about never re-downloading in a loop, which
+# the on-disk cache satisfies regardless of whether it is versioned.
+data/
+
+__pycache__/
+*.pyc
+.venv/
