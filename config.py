@@ -62,6 +62,9 @@ HTTP_TIMEOUT = 25
 HTTP_RETRIES = 3
 HTTP_BACKOFF = 2.0
 REQUEST_SPACING = 0.15
+# Archive reads are slow and mostly spent waiting, so the backbone backfill
+# fetches concurrently. Kept modest to stay well inside Open-Meteo's limits.
+MAX_WORKERS = 8
 
 # Abort the backfill if more than this fraction of runs cannot be retrieved --
 # isolated bad runs are tolerated and reported, a systemic outage is not.

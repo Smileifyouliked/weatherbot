@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
@@ -99,41 +100,47 @@ def ingest_backbone(start: date, end: date, limit: int | None) -> None:
           f"{cached} already cached, {len(todo)} to fetch"
           + (f" (limited to {limit})" if limit else ""))
 
+    # Individual archive reads are slow (often 20-60s for older dates), so these
+    # run concurrently. Only the fetch is parallel; merging into the parquet
+    # cache stays on the main thread.
     gaps, unreachable, batch, added = [], [], [], 0
     t0 = time.time()
-    for i, run in enumerate(todo, 1):
-        t = time.time()
+    done = 0
+
+    def work(run: datetime):
         try:
-            frame = fetch_run(run)
+            return run, fetch_run(run), None
         except wxio.SourceError as exc:
-            # The server hung or errored repeatedly on this specific run. That
-            # is a hole in the archive, not a reason to fabricate a value; it is
-            # recorded and reported, and a systemic rate is caught below.
-            unreachable.append((run, str(exc)[:80]))
-            frame = None
-            print(f"  unreachable: {run:%Y-%m-%d} ({str(exc)[:60]})", flush=True)
-        else:
-            if frame is None:
+            return run, None, exc
+
+    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
+        futures = {pool.submit(work, r): r for r in todo}
+        for fut in as_completed(futures):
+            run, frame, exc = fut.result()
+            done += 1
+            if exc is not None:
+                # The server hung or errored repeatedly on this specific run.
+                # That is a hole in the archive, not a reason to fabricate a
+                # value; it is recorded, and a systemic rate is caught below.
+                unreachable.append((run, str(exc)[:80]))
+                print(f"  unreachable: {run:%Y-%m-%d} ({str(exc)[:60]})", flush=True)
+            elif frame is None:
                 gaps.append(run)
-        dt = time.time() - t
-        if frame is not None:
-            batch.append(frame)
-        if dt > 10:
-            print(f"  slow: {run:%Y-%m-%d} took {dt:.0f}s", flush=True)
-        time.sleep(config.REQUEST_SPACING)
+            else:
+                batch.append(frame)
 
-        if i % 25 == 0 or i == len(todo):
-            rate = i / max(time.time() - t0, 1e-9)
-            eta = (len(todo) - i) / rate / 60
-            print(f"  {i}/{len(todo)} runs | {rate:.1f}/s | ETA {eta:.0f}m | "
-                  f"{len(gaps)} gaps | {len(unreachable)} unreachable", flush=True)
+            if done % 25 == 0 or done == len(todo):
+                rate = done / max(time.time() - t0, 1e-9)
+                eta = (len(todo) - done) / max(rate, 1e-9) / 60
+                print(f"  {done}/{len(todo)} runs | {rate:.1f}/s | ETA {eta:.0f}m | "
+                      f"{len(gaps)} gaps | {len(unreachable)} unreachable", flush=True)
 
-        # Flush periodically so a long backfill is resumable (hard rule 5).
-        if len(batch) >= 50 or i == len(todo):
-            if batch:
-                added += wxio.merge_raw(pd.concat(batch, ignore_index=True))
-                batch = []
-                print(f"    flushed -> +{added} rows total", flush=True)
+            # Flush periodically so a long backfill is resumable (hard rule 5).
+            if len(batch) >= 100 or done == len(todo):
+                if batch:
+                    added += wxio.merge_raw(pd.concat(batch, ignore_index=True))
+                    batch = []
+                    print(f"    flushed -> +{added} rows total", flush=True)
 
     if gaps:
         print(f"  archive gaps -- server reported {len(gaps)} runs not available:")
@@ -150,6 +157,10 @@ def ingest_backbone(start: date, end: date, limit: int | None) -> None:
             print(f"    ... and {len(unreachable) - 10} more")
         frac = len(unreachable) / max(len(todo), 1)
         if frac > config.MAX_UNREACHABLE_FRACTION:
+            print(f"  {frac:.1%} unreachable, above the "
+                  f"{config.MAX_UNREACHABLE_FRACTION:.0%} limit. These runs are not "
+                  f"cached, so re-running retries exactly them; try "
+                  f"--workers 2 --timeout 90 before treating this as an outage.")
             raise wxio.SourceError(
                 f"{frac:.1%} of runs unreachable (limit "
                 f"{config.MAX_UNREACHABLE_FRACTION:.0%}); treating as a source outage "
@@ -220,9 +231,15 @@ def main() -> None:
     ap.add_argument("--end", type=date.fromisoformat,
                     default=date.today() - timedelta(days=1))
     ap.add_argument("--limit", type=int, default=None)
+    # Stragglers that time out under concurrency usually succeed on a slower,
+    # more patient pass: --workers 2 --timeout 90
+    ap.add_argument("--workers", type=int, default=config.MAX_WORKERS)
+    ap.add_argument("--timeout", type=int, default=config.HTTP_TIMEOUT)
     ap.add_argument("--skip-backbone", action="store_true")
     ap.add_argument("--skip-ensemble", action="store_true")
     args = ap.parse_args()
+    config.MAX_WORKERS = args.workers
+    config.HTTP_TIMEOUT = args.timeout
 
     if not args.skip_backbone:
         ingest_backbone(args.start, args.end, args.limit)
