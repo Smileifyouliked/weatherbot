@@ -1,0 +1,6 @@
+# Cached API pulls. Regenerate with src/obs.py and src/forecast.py.
+data/
+
+__pycache__/
+*.pyc
+.venv/
