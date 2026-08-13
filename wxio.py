@@ -45,6 +45,12 @@ RAW_COLUMNS = [
 # ensemble are keyed on the rest of the row.
 IDENTITY = ["source", "model", "member", "issue_time", "valid_time", "variable"]
 
+# Rows whose issue_time is null (the ensemble) would otherwise all collapse onto
+# each other, because every pull carries NaT for the same valid_times. Keying
+# those on the pull date instead lets successive pulls accumulate as distinct
+# observations of the forecast, without inventing an issue_time we cannot know.
+DEDUP_KEY = IDENTITY + ["_pull_date"]
+
 
 class SourceError(RuntimeError):
     """A pull failed in a way that must stop the run (hard rule 7)."""
@@ -157,9 +163,13 @@ def merge_raw(new: pd.DataFrame) -> int:
 
     old = read_raw()
     combined = pd.concat([old, new], ignore_index=True)
-    # Later pull wins for an identical key, so a re-pull refreshes rather than
-    # duplicates.
-    combined = combined.drop_duplicates(subset=IDENTITY, keep="last")
+    # Later pull wins for an identical key, so a re-pull of a known run refreshes
+    # rather than duplicates. Rows without an issue_time are additionally keyed
+    # on their pull date (see DEDUP_KEY).
+    combined["_pull_date"] = combined["fetched_at"].dt.floor("D")
+    combined.loc[combined["issue_time"].notna(), "_pull_date"] = pd.NaT
+    combined = combined.drop_duplicates(subset=DEDUP_KEY, keep="last")
+    combined = combined.drop(columns="_pull_date")
     combined = combined.sort_values(["source", "model", "issue_time", "valid_time", "member"])
     combined = combined.reset_index(drop=True)
     combined.to_parquet(config.RAW_HOURLY, index=False)
@@ -200,13 +210,19 @@ def build_daily(official: pd.DataFrame | None = None) -> pd.DataFrame:
     local = df["valid_time"].dt.tz_convert(config.STATION_TZ)
     df["local_date"] = local.dt.date
 
-    keys = ["source", "model", "member", "issue_time", "issue_time_confirmed", "local_date"]
+    # Rows without an issue_time are separated by pull date for the same reason
+    # merge_raw keys on it: otherwise successive ensemble pulls collapse into a
+    # single day and the max is taken across unrelated runs.
+    df["pull_date"] = df["fetched_at"].dt.floor("D")
+    df.loc[df["issue_time"].notna(), "pull_date"] = pd.NaT
+
+    keys = ["source", "model", "member", "issue_time", "issue_time_confirmed",
+            "pull_date", "local_date"]
     grouped = df.groupby(keys, dropna=False, observed=True)
     daily = grouped["value_c"].agg(tmax_c="max", n_hours="count").reset_index()
 
     short = int((daily["n_hours"] < config.MIN_HOURS_PER_DAY).sum())
     daily = daily[daily["n_hours"] >= config.MIN_HOURS_PER_DAY].copy()
-    daily.attrs["dropped_short_days"] = short
 
     # lead_days is measured in station-local days between the run and the target
     # day, and is only meaningful where issue_time is confirmed.
@@ -219,9 +235,13 @@ def build_daily(official: pd.DataFrame | None = None) -> pd.DataFrame:
         prev = pd.read_parquet(config.DAILY)
         official = prev[prev["source"].isin(AUTHORITATIVE_DAILY)]
     if official is not None and len(official):
+        official = official.copy()
+        if "pull_date" not in official.columns:
+            official["pull_date"] = pd.NaT
         daily = pd.concat([daily, official], ignore_index=True)
         daily = daily.drop_duplicates(
-            subset=["source", "model", "member", "issue_time", "local_date"], keep="last"
+            subset=["source", "model", "member", "issue_time", "pull_date", "local_date"],
+            keep="last",
         )
 
     daily["n_hours"] = daily["n_hours"].astype("Int32")
@@ -230,4 +250,6 @@ def build_daily(official: pd.DataFrame | None = None) -> pd.DataFrame:
 
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     daily.to_parquet(config.DAILY, index=False)
+    # Set last: concat above does not carry attrs through.
+    daily.attrs["dropped_short_days"] = short
     return daily
