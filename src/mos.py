@@ -200,8 +200,18 @@ def predict_sigma(gamma: np.ndarray, Z: np.ndarray) -> np.ndarray:
 # --- walk-forward ------------------------------------------------------------
 
 def walk_forward(data: pd.DataFrame, targets: pd.DatetimeIndex,
-                 features: list[str], window: str) -> pd.DataFrame:
-    """Refit for every target day. `window` is 'expanding' or 'rolling'."""
+                 features: list[str], window: str,
+                 sigma_features: list[str] | None = None,
+                 keep_coefficients: bool = False) -> pd.DataFrame:
+    """Refit for every target day. `window` is 'expanding' or 'rolling'.
+
+    `sigma_features` overrides FEATURES_SIGMA, so an ablation can restrict the
+    spread model to the same predictors as its mean model. With
+    `keep_coefficients`, each row also carries the fitted mean coefficients,
+    both standardised (comparable across predictors) and in natural units
+    (degrees F per unit of the raw predictor).
+    """
+    sigma_features = sigma_features or FEATURES_SIGMA
     rows = []
     for D in targets:
         cutoff = D - timedelta(days=2)
@@ -221,15 +231,22 @@ def walk_forward(data: pd.DataFrame, targets: pd.DatetimeIndex,
         mu = float((Xte_s @ beta + b0)[0])
 
         resid = ytr - (Xtr_s @ beta + b0)
-        Ztr = train[FEATURES_SIGMA].to_numpy(float)
-        Zte = data.loc[[D], FEATURES_SIGMA].to_numpy(float)
+        Ztr = train[sigma_features].to_numpy(float)
+        Zte = data.loc[[D], sigma_features].to_numpy(float)
         Ztr_s, Zte_s = _standardize(Ztr, Zte)
         gamma = fit_log_sigma(Ztr_s, resid)
         sigma = float(predict_sigma(gamma, Zte_s)[0])
 
-        rows.append({"local_date": D, "mu": mu, "sigma": sigma,
-                     "obs": float(data.loc[D, "obs"]), "n_train": len(train),
-                     "alpha": alpha})
+        row = {"local_date": D, "mu": mu, "sigma": sigma,
+               "obs": float(data.loc[D, "obs"]), "n_train": len(train),
+               "alpha": alpha}
+        if keep_coefficients:
+            sd = Xtr.std(axis=0, ddof=0)
+            sd = np.where(sd < 1e-12, 1.0, sd)
+            for name, b, s in zip(features, beta, sd):
+                row[f"std__{name}"] = b        # per standard deviation
+                row[f"nat__{name}"] = b / s    # per raw unit
+        rows.append(row)
     return pd.DataFrame(rows).set_index("local_date")
 
 
