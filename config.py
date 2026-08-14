@@ -80,3 +80,6 @@ MAX_WORKERS = 8
 # Abort the backfill if more than this fraction of runs cannot be retrieved --
 # isolated bad runs are tolerated and reported, a systemic outage is not.
 MAX_UNREACHABLE_FRACTION = 0.05
+# ...but only once enough runs were attempted for that fraction to mean
+# anything. On an incremental pull of a few days, one timeout is already 25%.
+MIN_RUNS_FOR_OUTAGE_CHECK = 20

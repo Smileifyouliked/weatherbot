@@ -46,11 +46,24 @@ RAW_COLUMNS = [
 # ensemble are keyed on the rest of the row.
 IDENTITY = ["source", "model", "member", "issue_time", "valid_time", "variable"]
 
-# Rows whose issue_time is null (the ensemble) would otherwise all collapse onto
-# each other, because every pull carries NaT for the same valid_times. Keying
-# those on the pull date instead lets successive pulls accumulate as distinct
-# observations of the forecast, without inventing an issue_time we cannot know.
+# Forecast rows whose issue_time is null (the ensemble) would otherwise all
+# collapse onto each other, because every pull carries NaT for the same
+# valid_times. Keying those on the pull date instead lets successive pulls
+# accumulate as distinct observations of the forecast, without inventing an
+# issue_time we cannot know.
 DEDUP_KEY = IDENTITY + ["_pull_date"]
+
+# ...but only forecasts. An observation for a given valid_time is the same fact
+# whenever it was fetched, so keying it on the pull date would append a fresh
+# copy of the entire observational record on every re-run.
+OBSERVATION_SOURCES = ("asos_obs",)
+
+
+def pull_key(df: pd.DataFrame) -> pd.Series:
+    """Pull date for rows that need it, NaT for rows identified some other way."""
+    key = df["fetched_at"].dt.floor("D")
+    identified = df["issue_time"].notna() | df["source"].isin(OBSERVATION_SOURCES)
+    return key.mask(identified, pd.NaT)
 
 
 class SourceError(RuntimeError):
@@ -173,8 +186,7 @@ def merge_raw(new: pd.DataFrame) -> int:
     # Later pull wins for an identical key, so a re-pull of a known run refreshes
     # rather than duplicates. Rows without an issue_time are additionally keyed
     # on their pull date (see DEDUP_KEY).
-    combined["_pull_date"] = combined["fetched_at"].dt.floor("D")
-    combined.loc[combined["issue_time"].notna(), "_pull_date"] = pd.NaT
+    combined["_pull_date"] = pull_key(combined)
     combined = combined.drop_duplicates(subset=DEDUP_KEY, keep="last")
     combined = combined.drop(columns="_pull_date")
     combined = combined.sort_values(["source", "model", "issue_time", "valid_time", "member"])
@@ -257,11 +269,10 @@ def build_daily(official: pd.DataFrame | None = None,
     local = df["valid_time"].dt.tz_convert(config.STATION_TZ)
     df["local_date"] = local.dt.date
 
-    # Rows without an issue_time are separated by pull date for the same reason
-    # merge_raw keys on it: otherwise successive ensemble pulls collapse into a
-    # single day and the max is taken across unrelated runs.
-    df["pull_date"] = df["fetched_at"].dt.floor("D")
-    df.loc[df["issue_time"].notna(), "pull_date"] = pd.NaT
+    # Forecast rows without an issue_time are separated by pull date for the
+    # same reason merge_raw keys on it: otherwise successive ensemble pulls
+    # collapse into a single day and the max is taken across unrelated runs.
+    df["pull_date"] = pull_key(df)
 
     keys = ["source", "model", "member", "issue_time", "issue_time_confirmed",
             "pull_date", "local_date"]

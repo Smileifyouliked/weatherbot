@@ -207,7 +207,16 @@ def main() -> None:
             print(f"    ... and {len(missing) - 8} more")
 
     if not got:
-        raise wxio.SourceError("no NBM forecasts parsed; nothing written")
+        # Nothing new is only a failure when there was also nothing cached. On a
+        # warm cache the outstanding cycles are the ones with no bulletin at
+        # all, and re-running should be a no-op rather than an error.
+        if have:
+            print(f"  nothing new to add; {len(have)} cycles already cached")
+            daily = wxio.build_daily()
+            n = int((daily["source"] == SOURCE).sum())
+            print(f"  daily.parquet rebuilt: {len(daily)} rows, {n} NBM days")
+            return
+        raise wxio.SourceError("no NBM forecasts parsed and nothing cached")
 
     df = pd.DataFrame(got).sort_values("local_date")
     floored = int((df["sigma_f"].fillna(0) < SIGMA_FLOOR_F).sum())

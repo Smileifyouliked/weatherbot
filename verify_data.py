@@ -113,8 +113,18 @@ def main() -> int:
         vmin, vmax, unit = limits[var]
         check(vmin <= lo and hi <= vmax, f"{var} within [{vmin:g}, {vmax:g}] {unit}",
               f"range {lo:.1f} to {hi:.1f} {unit}")
-    dupes = int(raw.duplicated(subset=wxio.IDENTITY).sum())
-    check(dupes == 0, "no duplicate rows on the identity key", f"{dupes:,} duplicates")
+    # Checked on the same key merge_raw deduplicates with: ensemble rows from
+    # different pull dates are distinct observations of the forecast, not
+    # duplicates, so IDENTITY alone would flag them wrongly.
+    keyed = raw.assign(_pull_date=wxio.pull_key(raw))
+    dupes = int(keyed.duplicated(subset=wxio.DEDUP_KEY).sum())
+    check(dupes == 0, "no duplicate rows on the cache key", f"{dupes:,} duplicates")
+
+    obs_pulls = raw[raw["source"].isin(wxio.OBSERVATION_SOURCES)]
+    if len(obs_pulls):
+        per_time = int(obs_pulls.duplicated(subset=["source", "valid_time", "variable"]).sum())
+        check(per_time == 0, "observations not duplicated across pulls",
+              f"{per_time:,} repeated observation rows")
 
     # --- provenance ----------------------------------------------------------
     hdr("issue_time provenance")

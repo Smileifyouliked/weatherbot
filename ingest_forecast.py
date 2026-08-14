@@ -71,6 +71,15 @@ def fetch_run(run: datetime) -> pd.DataFrame | None:
     valid = pd.to_datetime(h["time"], utc=True)
     fetched = wxio.utcnow()
 
+    # Some archived runs are partial: 2025-08-07 returns wind and dewpoint but
+    # no temperature or cloud. Without the target variable the run is unusable
+    # whatever else it holds, and the response is deterministic, so this is an
+    # archive gap rather than a transport failure. Classifying it as unreachable
+    # made these runs trip the outage guard on every warm-cache pull, where the
+    # denominator is only the handful still outstanding.
+    if not pd.to_numeric(h.get(config.VARIABLE), errors="coerce").notna().any():
+        return None
+
     frames = []
     for var in config.FORECAST_VARIABLES:
         if var not in h.columns:
@@ -78,10 +87,12 @@ def fetch_run(run: datetime) -> pd.DataFrame | None:
         value = pd.to_numeric(h[var], errors="coerce")
         keep = value.notna()
         if not keep.any():
-            # A predictor the model does not actually carry (e.g. pressure-level
-            # fields on ecmwf_ifs) comes back as all nulls behind a 200.
+            # The target variable is present but this predictor is not, so the
+            # model does not carry it at all (e.g. pressure-level fields on
+            # ecmwf_ifs). That is a configuration error, not an archive gap.
             raise wxio.SourceError(
-                f"run {run:%Y-%m-%dT%H:%M} returned all-null values for {var!r}")
+                f"run {run:%Y-%m-%dT%H:%M} has {config.VARIABLE} but returned "
+                f"all-null values for {var!r}; this model does not carry it")
         frames.append(
             pd.DataFrame(
                 {
@@ -169,7 +180,10 @@ def ingest_backbone(start: date, end: date, limit: int | None) -> None:
         if len(unreachable) > 10:
             print(f"    ... and {len(unreachable) - 10} more")
         frac = len(unreachable) / max(len(todo), 1)
-        if frac > config.MAX_UNREACHABLE_FRACTION:
+        # The fraction only means something over a reasonable number of
+        # attempts. On an incremental run of a few outstanding days, one
+        # timeout is already 25% and would abort a healthy pull.
+        if len(todo) >= config.MIN_RUNS_FOR_OUTAGE_CHECK and frac > config.MAX_UNREACHABLE_FRACTION:
             print(f"  {frac:.1%} unreachable, above the "
                   f"{config.MAX_UNREACHABLE_FRACTION:.0%} limit. These runs are not "
                   f"cached, so re-running retries exactly them; try "
