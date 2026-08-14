@@ -21,16 +21,59 @@ DATA_SOURCES.md      what each endpoint can and cannot prove about provenance
 ## Running
 
 ```bash
-pip install pandas pyarrow requests
+pip install pandas pyarrow requests matplotlib
 
-python3 ingest_asos.py        # observations, 2023-01-01 onward
-python3 ingest_forecast.py    # ECMWF runs 2024-03-14 onward, + live ensemble
-python3 verify_data.py        # must exit 0 before anything downstream
+./make_cache.sh          # rebuild or resume every cache, then verify
+./make_cache.sh --fresh  # delete data/ first, then rebuild from nothing
 ```
 
-Both ingestion modules are resumable: runs already in the cache are skipped, so
+That runs the ingestion modules in dependency order and finishes with
+`verify_data.py`, which must exit 0 before anything downstream is trustworthy.
+Any failing step stops the script, so a partial cache is never left looking
+complete (hard rule 7).
+
+To run a single stage instead:
+
+```bash
+python3 ingest_asos.py        # observations, 2023-01-01 onward
+python3 ingest_forecast.py    # ECMWF runs 2024-03-14 onward, + live ensemble
+python3 ingest_nbm.py         # NBM day-ahead max + spread
+python3 verify_data.py
+```
+
+All ingestion modules are resumable: anything already cached is skipped, so
 re-running never re-downloads (hard rule 5). `ingest_forecast.py` takes
-`--start`, `--end`, `--limit`, `--skip-backbone` and `--skip-ensemble`.
+`--start`, `--end`, `--limit`, `--workers`, `--timeout`, `--skip-backbone` and
+`--skip-ensemble`; `ingest_nbm.py` takes `--start`, `--end`, `--workers` and
+`--refresh`.
+
+### Runtime
+
+| Stage | Cold (`--fresh`), estimated | Warm re-run, measured |
+|---|---|---|
+| Observations | ~25 s | 9 s |
+| ECMWF backbone, main pass | ~30 min | 1 m 25 s |
+| ECMWF backbone, straggler retry | ~13 min | 1 m 36 s |
+| ECMWF ensemble | ~5 s | 4 s |
+| NBM bulletins | ~2 min | 3 s |
+| Verify | ~5 s | 3 s |
+| **Total** | **~45–55 min** | **3 m 20 s** |
+
+Warm figures are from an actual run on a populated cache. Cold figures are
+extrapolated from observed per-request rates rather than timed end to end.
+
+The backbone dominates, and not because of volume: the Single Runs archive
+serves roughly 0.4–0.5 runs/second, and a minority of runs hang server-side
+rather than returning an error. The straggler pass exists because those hangs
+are sporadic — a slower, more patient second pass recovers nearly all of them.
+
+A warm run is not free either. The backbone still retries the six runs that are
+permanently absent from the archive (2025-08-05 … 2025-08-09 and 2026-06-23),
+which is essentially all of the three minutes above. They are re-attempted
+rather than blacklisted because an archive gap can be backfilled upstream later.
+
+Observations are pulled in a single request covering the whole range, and NBM
+fetches ~21 MB per cycle at ~20 MB/s, so neither is a bottleneck.
 
 ## The two caches
 
@@ -38,10 +81,17 @@ re-running never re-downloads (hard rule 5). `ingest_forecast.py` takes
 per (source, model, member, issue_time, valid_time). All timestamps UTC.
 
 `data/daily.parquet` — station-local daily maxima: the reported observed max
-(the target), the hourly-derived max (QC), and forecast maxima per run and
-member with `lead_days`.
+(the target), the hourly-derived max (QC), NBM's day-ahead max with its
+published spread, and forecast maxima per run and member with `lead_days`.
 
-Both are gitignored; they are rebuildable local state.
+Both are gitignored; they are rebuildable local state, and `./make_cache.sh`
+reproduces them. Together they are about 1.6 MB.
+
+Rows are keyed so that re-running is a no-op rather than an append. Forecast
+rows whose run cannot be identified (the ensemble) are additionally keyed on
+their pull date, so successive pulls accumulate as distinct observations of the
+forecast; observations are keyed on valid time alone, since an observation is
+the same fact whenever it was fetched.
 
 ## Provenance, in short
 
