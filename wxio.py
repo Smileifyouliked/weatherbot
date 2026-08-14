@@ -14,8 +14,9 @@ raw_hourly schema
   issue_time_confirmed  True only when the run was named in the request and
                         validated server-side.
   valid_time            UTC timestamp the value applies to
-  variable              e.g. 'temperature_2m'
-  value_c               degrees Celsius
+  variable              e.g. 'temperature_2m', 'cloud_cover'
+  value                 units depend on `variable`: degrees C for temperatures
+                        and dewpoints, percent for cloud cover, km/h for wind
   fetched_at            UTC time of the pull; upper bound on issue_time
 """
 
@@ -37,7 +38,7 @@ RAW_COLUMNS = [
     "issue_time_confirmed",
     "valid_time",
     "variable",
-    "value_c",
+    "value",
     "fetched_at",
 ]
 
@@ -116,7 +117,7 @@ def empty_raw() -> pd.DataFrame:
             "issue_time_confirmed": pd.Series(dtype="boolean"),
             "valid_time": pd.Series(dtype="datetime64[us, UTC]"),
             "variable": pd.Series(dtype="string"),
-            "value_c": pd.Series(dtype="float64"),
+            "value": pd.Series(dtype="float64"),
             "fetched_at": pd.Series(dtype="datetime64[us, UTC]"),
         }
     )
@@ -129,7 +130,7 @@ def _coerce(df: pd.DataFrame) -> pd.DataFrame:
     df["member"] = df["member"].astype("Int16")
     df["issue_time_confirmed"] = df["issue_time_confirmed"].astype("boolean")
     df["variable"] = df["variable"].astype("string")
-    df["value_c"] = df["value_c"].astype("float64")
+    df["value"] = df["value"].astype("float64")
     for col in ("issue_time", "valid_time", "fetched_at"):
         s = pd.to_datetime(df[col], utc=True, errors="raise")
         df[col] = s.astype("datetime64[us, UTC]")
@@ -139,7 +140,13 @@ def _coerce(df: pd.DataFrame) -> pd.DataFrame:
 def read_raw() -> pd.DataFrame:
     if not config.RAW_HOURLY.exists():
         return empty_raw()
-    return _coerce(pd.read_parquet(config.RAW_HOURLY))
+    df = pd.read_parquet(config.RAW_HOURLY)
+    # Caches written before non-temperature predictors existed used value_c.
+    # The column holds C, percent or km/h depending on `variable`, so the name
+    # no longer claims a unit.
+    if "value_c" in df.columns and "value" not in df.columns:
+        df = df.rename(columns={"value_c": "value"})
+    return _coerce(df)
 
 
 def check_rule_1(df: pd.DataFrame) -> None:
@@ -176,13 +183,24 @@ def merge_raw(new: pd.DataFrame) -> int:
     return len(combined) - len(old)
 
 
-def cached_issue_times(source: str, model: str) -> set[pd.Timestamp]:
-    """Issue times already on disk, so a re-run never re-downloads (rule 5)."""
+def cached_issue_times(source: str, model: str,
+                       variables: list[str] | None = None) -> set[pd.Timestamp]:
+    """Issue times already on disk, so a re-run never re-downloads (rule 5).
+
+    When `variables` is given, a run counts as cached only if every one of them
+    is present. Adding a predictor therefore refetches the runs that predate it
+    instead of silently leaving them short a column.
+    """
     df = read_raw()
     if df.empty:
         return set()
     sel = df[(df["source"] == source) & (df["model"] == model)]
-    return set(sel["issue_time"].dropna().unique())
+    if not variables:
+        return set(sel["issue_time"].dropna().unique())
+
+    wanted = set(variables)
+    have = sel.groupby("issue_time", observed=True)["variable"].agg(set)
+    return {t for t, got in have.items() if wanted <= set(got)}
 
 
 # Daily sources that are authoritative rather than derived from raw_hourly, and
@@ -219,7 +237,7 @@ def build_daily(official: pd.DataFrame | None = None) -> pd.DataFrame:
     keys = ["source", "model", "member", "issue_time", "issue_time_confirmed",
             "pull_date", "local_date"]
     grouped = df.groupby(keys, dropna=False, observed=True)
-    daily = grouped["value_c"].agg(tmax_c="max", n_hours="count").reset_index()
+    daily = grouped["value"].agg(tmax_c="max", n_hours="count").reset_index()
 
     short = int((daily["n_hours"] < config.MIN_HOURS_PER_DAY).sum())
     daily = daily[daily["n_hours"] >= config.MIN_HOURS_PER_DAY].copy()

@@ -56,7 +56,7 @@ def main() -> int:
     # --- inventory -----------------------------------------------------------
     hdr("Inventory by source")
     inv = raw.groupby(["source", "model"], dropna=False, observed=True).agg(
-        rows=("value_c", "size"),
+        rows=("value", "size"),
         members=("member", lambda s: s.nunique(dropna=True)),
         first_valid=("valid_time", "min"),
         last_valid=("valid_time", "max"),
@@ -94,11 +94,25 @@ def main() -> int:
 
     # --- hard rule 7 ---------------------------------------------------------
     hdr("Hard rule 7 -- no silent fills")
-    check(int(raw["value_c"].isna().sum()) == 0, "no null values in raw cache",
-          f"{int(raw['value_c'].isna().sum()):,} nulls")
-    lo, hi = raw["value_c"].min(), raw["value_c"].max()
-    check(-40 < lo and hi < 55, "temperatures physically plausible",
-          f"range {lo:.1f}C to {hi:.1f}C")
+    check(int(raw["value"].isna().sum()) == 0, "no null values in raw cache",
+          f"{int(raw['value'].isna().sum()):,} nulls")
+
+    # Ranges are per-variable: the value column carries degrees C, percent and
+    # km/h depending on `variable`, so one global bound would be meaningless.
+    limits = {
+        "temperature_2m": (-40.0, 55.0, "C"),
+        "dew_point_2m": (-50.0, 40.0, "C"),
+        "cloud_cover": (0.0, 100.0, "%"),
+        "wind_speed_10m": (0.0, 200.0, "km/h"),
+    }
+    for var, grp in raw.groupby("variable", observed=True):
+        lo, hi = float(grp["value"].min()), float(grp["value"].max())
+        if var not in limits:
+            warn(f"no plausibility range defined for {var!r}", f"range {lo:.1f} to {hi:.1f}")
+            continue
+        vmin, vmax, unit = limits[var]
+        check(vmin <= lo and hi <= vmax, f"{var} within [{vmin:g}, {vmax:g}] {unit}",
+              f"range {lo:.1f} to {hi:.1f} {unit}")
     dupes = int(raw.duplicated(subset=wxio.IDENTITY).sum())
     check(dupes == 0, "no duplicate rows on the identity key", f"{dupes:,} duplicates")
 

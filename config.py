@@ -38,6 +38,17 @@ ENSEMBLE_FORECAST_DAYS = 7
 
 VARIABLE = "temperature_2m"
 
+# Predictors pulled per run, in one request each. temperature_850hPa is NOT
+# here: ecmwf_ifs accepts the parameter but returns all nulls for it, and the
+# models that do serve it (GFS, ICON) only have Single Runs archives from
+# 2026-04-02, which would cut training from ~874 rows to ~130.
+FORECAST_VARIABLES = [
+    "temperature_2m",
+    "cloud_cover",
+    "wind_speed_10m",
+    "dew_point_2m",
+]
+
 # --- Endpoints ---------------------------------------------------------------
 SINGLE_RUNS_URL = "https://single-runs-api.open-meteo.com/v1/forecast"
 ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
