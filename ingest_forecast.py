@@ -55,10 +55,11 @@ def run_times(start: date, end: date) -> list[datetime]:
 
 
 def fetch_run(run: datetime) -> pd.DataFrame | None:
+    """One request per run, carrying every predictor in FORECAST_VARIABLES."""
     params = {
         "latitude": config.LATITUDE,
         "longitude": config.LONGITUDE,
-        "hourly": config.VARIABLE,
+        "hourly": ",".join(config.FORECAST_VARIABLES),
         "models": config.BACKBONE_MODEL,
         "run": run.strftime("%Y-%m-%dT%H:%M"),
     }
@@ -68,29 +69,41 @@ def fetch_run(run: datetime) -> pd.DataFrame | None:
 
     h = _hourly_frame(payload, config.VARIABLE)
     valid = pd.to_datetime(h["time"], utc=True)
-    value = pd.to_numeric(h[config.VARIABLE], errors="coerce")
-    keep = value.notna()
-    if not keep.any():
-        raise wxio.SourceError(f"run {run:%Y-%m-%dT%H:%M} returned all-null values")
+    fetched = wxio.utcnow()
 
-    return pd.DataFrame(
-        {
-            "source": "single_runs",
-            "model": config.BACKBONE_MODEL,
-            "member": pd.NA,
-            "issue_time": run,          # from the request; validated server-side
-            "issue_time_confirmed": True,
-            "valid_time": valid[keep],
-            "variable": config.VARIABLE,
-            "value_c": value[keep],
-            "fetched_at": wxio.utcnow(),
-        }
-    )
+    frames = []
+    for var in config.FORECAST_VARIABLES:
+        if var not in h.columns:
+            raise wxio.SourceError(f"run {run:%Y-%m-%dT%H:%M} response missing {var!r}")
+        value = pd.to_numeric(h[var], errors="coerce")
+        keep = value.notna()
+        if not keep.any():
+            # A predictor the model does not actually carry (e.g. pressure-level
+            # fields on ecmwf_ifs) comes back as all nulls behind a 200.
+            raise wxio.SourceError(
+                f"run {run:%Y-%m-%dT%H:%M} returned all-null values for {var!r}")
+        frames.append(
+            pd.DataFrame(
+                {
+                    "source": "single_runs",
+                    "model": config.BACKBONE_MODEL,
+                    "member": pd.NA,
+                    "issue_time": run,   # from the request; validated server-side
+                    "issue_time_confirmed": True,
+                    "valid_time": valid[keep],
+                    "variable": var,
+                    "value": value[keep],
+                    "fetched_at": fetched,
+                }
+            )
+        )
+    return pd.concat(frames, ignore_index=True)
 
 
 def ingest_backbone(start: date, end: date, limit: int | None) -> None:
     wanted = run_times(start, end)
-    have = wxio.cached_issue_times("single_runs", config.BACKBONE_MODEL)
+    have = wxio.cached_issue_times("single_runs", config.BACKBONE_MODEL,
+                                   config.FORECAST_VARIABLES)
     todo = [r for r in wanted if pd.Timestamp(r) not in have]
     cached = len(wanted) - len(todo)
     if limit:
@@ -208,7 +221,7 @@ def ingest_ensemble() -> None:
                     "issue_time_confirmed": False,
                     "valid_time": valid[keep],
                     "variable": config.VARIABLE,
-                    "value_c": value[keep],
+                    "value": value[keep],
                     "fetched_at": fetched,
                 }
             )

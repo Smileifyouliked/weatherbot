@@ -71,7 +71,7 @@ def to_raw(df: pd.DataFrame) -> pd.DataFrame:
             "issue_time_confirmed": False,
             "valid_time": valid[keep],
             "variable": config.VARIABLE,
-            "value_c": (tmpf[keep] - 32.0) * 5.0 / 9.0,
+            "value": (tmpf[keep] - 32.0) * 5.0 / 9.0,
             "fetched_at": fetched,
         }
     )
