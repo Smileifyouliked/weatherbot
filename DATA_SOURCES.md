@@ -129,6 +129,47 @@ Neither is filled. If more than `MAX_UNREACHABLE_FRACTION` (5%) of runs are
 unreachable the backfill aborts, on the grounds that a systemic outage is not an
 archive gap and should not be quietly absorbed into the dataset.
 
+## NBM comes from S3, not api.weather.gov
+
+`api.weather.gov/gridpoints` serves **only the current forecast**. There is no
+date parameter and no archive — a request returns `updateTime` of the latest
+run with ~8 `maxTemperature` entries forward, and no percentiles (only
+`maxTemperature`, `minTemperature`, `apparentTemperature`,
+`wetBulbGlobeTemperature`). Archive depth is zero, so it cannot support a
+historical baseline at all.
+
+`ingest_nbm.py` therefore reads the NBM station bulletins on
+`noaa-nbm-grib2-pds`, which run 2020-05-18 to present at hourly cycles. The NBE
+("extended") bulletin gives, per station, `TXN` (max/min temperature, °F) and
+`XND` (its standard deviation) — a mean *and* a spread, so NBM scores as a real
+probabilistic baseline rather than a point forecast.
+
+**Day alignment was verified, not assumed.** For the 00Z cycle on date D, the
+`TXN` entry at FHR 24 — valid D+1 00Z, the 12-hour daytime period ending 20:00
+local on D — is the maximum for **local day D**. Checked against reported
+maxima at KNYC for 2025-08-12..14, which matched 89/88/89 exactly; reading the
+column's printed day label instead disagreed with observations on most days.
+That makes the 00Z cycle on D a lead +1d forecast issued at D 00:00 UTC, the
+same issue time and lead as the ECMWF backbone.
+
+### The three-digit column trap
+
+Bulletin values are right-aligned in fixed-width fields, so a three-digit
+reading starts one character to the left of where a two-digit forecast hour
+starts:
+
+```
+ FHR    24  36| 48  60|
+ TXN   102  84|102  81|
+```
+
+Slicing the `FHR` digit span alone reads `102` as `02`. This produced a
+plausible small number rather than an error, and silently corrupted every day
+at or above 100 °F — 2026-07-02 parsed as 2 °F against an observed 100 °F, which
+inflated NBM's summer CRPS from 1.53 to 3.62. Fields are now taken from the end
+of the previous field to the end of the current one, and a guard rejects any
+column where `TXN` sits more than 5 °F below the `TMP` value beside it.
+
 ## Consequence for hard rule 4
 
 The raw-ensemble-mean baseline cannot be constructed historically — the ensemble

@@ -58,6 +58,25 @@ REPORT_DIR = Path(__file__).resolve().parent.parent / "reports"
 
 # --- features ----------------------------------------------------------------
 
+def load_nbm() -> pd.DataFrame:
+    """NBM day-ahead max and its published standard deviation, in degrees F.
+
+    Same issue time and lead as the ECMWF backbone (00Z cycle on the target
+    local day), so it drops straight into the comparison.
+    """
+    daily = pd.read_parquet(config.DAILY)
+    n = daily[daily["source"] == "nbm"]
+    if n.empty:
+        return pd.DataFrame(columns=["mu", "sigma"]).rename_axis("local_date")
+    out = pd.DataFrame({
+        "mu": c_to_f(n["tmax_c"].to_numpy(float)),
+        # A standard deviation is a difference, so it scales by 9/5 alone.
+        "sigma": n["tmax_sigma_c"].to_numpy(float) * 9.0 / 5.0,
+    }, index=pd.to_datetime(n["local_date"]).values)
+    out.index.name = "local_date"
+    return out.sort_index()
+
+
 def build_features() -> pd.DataFrame:
     """Daily predictors per target day, from the lead +1d run only.
 
@@ -349,6 +368,7 @@ def main() -> None:
 
     obs, fc_daily = load_daily(LEAD)
     feats = build_features()
+    nbm = load_nbm()
 
     data = feats.join(obs.rename("obs"), how="inner").dropna(
         subset=FEATURES_MEAN + ["obs"])
@@ -377,10 +397,15 @@ def main() -> None:
     common = base.dropna(subset=["obs", "raw_mu", "raw_sigma", "clim_mu",
                                  "clim_sigma", "pers_mu", "pers_sigma"]).index
     common = common.intersection(mos_exp.index).intersection(mos_rol.index)
+    nbm_ok = nbm.dropna(subset=["mu", "sigma"]).index
+    dropped_for_nbm = len(common.difference(nbm_ok))
+    common = common.intersection(nbm_ok)
     base_c, exp_c, rol_c = base.loc[common], mos_exp.loc[common], mos_rol.loc[common]
+    nbm_c = nbm.loc[common].assign(obs=base_c["obs"].to_numpy(float))
 
     print(f"evaluation: {common.min():%Y-%m-%d} -> {common.max():%Y-%m-%d}, "
-          f"{len(common)} days common to every row")
+          f"{len(common)} days common to every row"
+          + (f" ({dropped_for_nbm} dropped for missing NBM)" if dropped_for_nbm else ""))
     print(f"training  : expanding {exp_c['n_train'].min()}-{exp_c['n_train'].max()} rows, "
           f"rolling {rol_c['n_train'].min()}-{rol_c['n_train'].max()} rows")
     print(f"ridge alpha: expanding median {np.median(exp_c['alpha']):g}, "
@@ -396,6 +421,7 @@ def main() -> None:
     rows = [
         ("MOS expanding", mos_scores(exp_c)),
         ("MOS rolling", mos_scores(rol_c)),
+        ("NBM", mos_scores(nbm_c)),
         ("raw deterministic", score_row(base_c, "raw")),
         ("climatology", score_row(base_c, "clim")),
         ("persistence", score_row(base_c, "pers")),
@@ -420,6 +446,7 @@ def main() -> None:
     series = {
         "MOS expanding": (exp_c["obs"], exp_c["mu"], exp_c["sigma"]),
         "MOS rolling": (rol_c["obs"], rol_c["mu"], rol_c["sigma"]),
+        "NBM": (nbm_c["obs"], nbm_c["mu"], nbm_c["sigma"]),
         "raw deterministic": (base_c["obs"], base_c["raw_mu"], base_c["raw_sigma"]),
         "climatology": (base_c["obs"], base_c["clim_mu"], base_c["clim_sigma"]),
         "persistence": (base_c["obs"], base_c["pers_mu"], base_c["pers_sigma"]),
@@ -436,7 +463,8 @@ def main() -> None:
           + f"{len(common):>9}")
 
     # --- PIT ---
-    panels = [("MOS expanding", pit_values(exp_c)), ("MOS rolling", pit_values(rol_c))]
+    panels = [("MOS expanding", pit_values(exp_c)), ("MOS rolling", pit_values(rol_c)),
+              ("NBM", pit_values(nbm_c))]
     raw_pit = pd.DataFrame({"obs": base_c["obs"], "mu": base_c["raw_mu"],
                             "sigma": base_c["raw_sigma"]})
     panels.append(("raw deterministic", pit_values(raw_pit)))

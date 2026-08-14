@@ -205,20 +205,49 @@ def cached_issue_times(source: str, model: str,
 
 # Daily sources that are authoritative rather than derived from raw_hourly, and
 # so must survive a rebuild of daily.parquet.
-AUTHORITATIVE_DAILY = ("asos_daily_official",)
+AUTHORITATIVE_DAILY = ("asos_daily_official", "nbm")
 
 
-def build_daily(official: pd.DataFrame | None = None) -> pd.DataFrame:
+DAILY_KEY = ["source", "model", "member", "issue_time", "pull_date", "local_date"]
+
+
+def _dedup_daily(daily: pd.DataFrame) -> pd.DataFrame:
+    """Collapse rows sharing a key, keeping the most recently added.
+
+    Missing values are replaced by sentinels first. Several key columns are
+    entirely NA for some sources -- member and pull_date for NBM, issue_time for
+    observations -- and pandas does not treat pd.NA as equal to itself here, so
+    dropping duplicates on the raw columns silently keeps both copies. That
+    turns a corrected refetch into a duplicate row rather than a replacement.
+    """
+    keyed = daily.copy()
+    sentinel_time = pd.Timestamp("1900-01-01", tz="UTC")
+    for col in DAILY_KEY:
+        if col in ("issue_time", "pull_date"):
+            keyed[col + "_k"] = pd.to_datetime(keyed[col], utc=True).fillna(sentinel_time)
+        elif col == "member":
+            keyed[col + "_k"] = pd.to_numeric(keyed[col], errors="coerce").fillna(-1.0)
+        else:
+            keyed[col + "_k"] = keyed[col].astype(object).where(keyed[col].notna(), "\x00")
+    kcols = [c + "_k" for c in DAILY_KEY]
+    keep = ~keyed.duplicated(subset=kcols, keep="last")
+    return daily[keep.to_numpy()]
+
+
+def build_daily(official: pd.DataFrame | None = None,
+                extra: pd.DataFrame | None = None) -> pd.DataFrame:
     """Derive station-local daily max from the raw hourly cache.
 
     This is the one place UTC is converted to station-local time (rule 6).
     Days with fewer than MIN_HOURS_PER_DAY values are dropped and counted --
     never interpolated or filled.
 
-    `official` carries station daily maxima that are reported rather than
-    derived (see ingest_asos.fetch_official_daily). When it is None, any such
-    rows already in daily.parquet are preserved so that rebuilding from a
-    forecast pull does not silently drop the target variable.
+    `official` and `extra` both carry daily rows that are reported rather than
+    derived from raw_hourly -- the station's own daily maximum, and NBM's
+    day-ahead forecast. Rows already on disk for any AUTHORITATIVE_DAILY source
+    are always reloaded first and then overlaid, so ingesting one such source
+    never drops another. (`official` and `extra` are equivalent; both names
+    exist so each ingestion module reads naturally at its call site.)
     """
     raw = read_raw()
     if raw.empty:
@@ -248,21 +277,39 @@ def build_daily(official: pd.DataFrame | None = None) -> pd.DataFrame:
     lead = pd.to_datetime(daily["local_date"]) - pd.to_datetime(issue_local.dt.date)
     daily["lead_days"] = lead.dt.days.astype("Int16")
 
-    # Re-attach reported (non-derived) daily rows.
-    if official is None and config.DAILY.exists():
+    # Re-attach reported (non-derived) daily rows: everything already on disk
+    # first, then whatever this run produced on top of it.
+    attach = []
+    if config.DAILY.exists():
         prev = pd.read_parquet(config.DAILY)
-        official = prev[prev["source"].isin(AUTHORITATIVE_DAILY)]
-    if official is not None and len(official):
-        official = official.copy()
-        if "pull_date" not in official.columns:
-            official["pull_date"] = pd.NaT
-        daily = pd.concat([daily, official], ignore_index=True)
-        daily = daily.drop_duplicates(
-            subset=["source", "model", "member", "issue_time", "pull_date", "local_date"],
-            keep="last",
-        )
+        attach.append(prev[prev["source"].isin(AUTHORITATIVE_DAILY)])
+    for frame in (official, extra):
+        if frame is not None and len(frame):
+            attach.append(frame)
 
-    daily["n_hours"] = daily["n_hours"].astype("Int32")
+    if attach:
+        add = pd.concat(attach, ignore_index=True)
+        if "pull_date" not in add.columns:
+            add["pull_date"] = pd.NaT
+        daily = pd.concat([daily, add], ignore_index=True)
+        daily = _dedup_daily(daily)
+
+    # Normalise the schema after concatenation. Sources contribute local_date as
+    # date objects or Timestamps, and member as Int16 or Float64; concat widens
+    # those to object, which then fails to sort. Pin every column explicitly.
+    if "tmax_sigma_c" not in daily.columns:
+        daily["tmax_sigma_c"] = pd.NA
+    daily["source"] = daily["source"].astype("string")
+    daily["model"] = daily["model"].astype("string")
+    daily["member"] = pd.to_numeric(daily["member"], errors="coerce").astype("Float64")
+    daily["issue_time_confirmed"] = daily["issue_time_confirmed"].astype("boolean")
+    daily["local_date"] = pd.to_datetime(daily["local_date"])
+    for col in ("issue_time", "pull_date"):
+        daily[col] = pd.to_datetime(daily[col], utc=True)
+    for col in ("tmax_c", "tmax_sigma_c"):
+        daily[col] = pd.to_numeric(daily[col], errors="coerce").astype("float64")
+    daily["n_hours"] = pd.to_numeric(daily["n_hours"], errors="coerce").astype("Int32")
+    daily["lead_days"] = pd.to_numeric(daily["lead_days"], errors="coerce").astype("Float64")
     daily = daily.sort_values(["source", "model", "local_date", "issue_time", "member"])
     daily = daily.reset_index(drop=True)
 
