@@ -84,8 +84,29 @@ per (source, model, member, issue_time, valid_time). All timestamps UTC.
 (the target), the hourly-derived max (QC), NBM's day-ahead max with its
 published spread, and forecast maxima per run and member with `lead_days`.
 
-Both are gitignored; they are rebuildable local state, and `./make_cache.sh`
-reproduces them. Together they are about 1.6 MB.
+Both are committed (about 1.6 MB together) so the published numbers can be
+reproduced without rebuilding, and `./make_cache.sh` regenerates them from the
+sources at any time.
+
+### Cache snapshot policy
+
+The committed parquet files are a **point-in-time snapshot, refreshed when
+results are published — not on every pull.**
+
+The reason is churn, not size. `raw_hourly.parquet` is rewritten whole on every
+ingestion, so each pull produces an entirely new ~1.5 MB blob rather than a
+delta. Committing on every run would add roughly half a gigabyte of history per
+year for data that `./make_cache.sh` can rebuild from scratch. So:
+
+- **Do** refresh the snapshot when the numbers in a report or PR change, in the
+  same commit as those numbers, so the data and the results stay in step.
+- **Don't** commit it after a routine daily pull. Leave the working tree dirty,
+  or `git checkout -- data/` to discard.
+
+Git LFS is deliberately not used. It exists to keep large blobs out of pack
+files, and at 1.6 MB it would add a clone-time dependency — a missing LFS client
+turns the parquet files into unusable pointer stubs — for no benefit. Revisit
+only if the snapshot passes ~50 MB.
 
 Rows are keyed so that re-running is a no-op rather than an append. Forecast
 rows whose run cannot be identified (the ensemble) are additionally keyed on
