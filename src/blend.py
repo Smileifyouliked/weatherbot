@@ -286,7 +286,7 @@ def main() -> None:
     for label, frame in rows:
         cells = []
         for s in ORDER:
-            m = (season == s).to_numpy()
+            m = np.asarray(season == s)
             cells.append(f"{score(frame[m])['CRPS']:>9.2f}" if m.sum() else f"{'-':>9}")
         print(f"{label:<20}" + "".join(cells) + f"{score(frame)['CRPS']:>9.2f}")
     print(f"{'n days':<20}" + "".join(f"{int((season == s).sum()):>9}" for s in ORDER)
@@ -299,7 +299,7 @@ def main() -> None:
     for label, frame in (("inverse-variance", bl_iv), ("fixed", bl_fx),
                          ("seasonal", bl_se)):
         f = frame.loc[common]
-        cells = [f"{f['w'][(season == s).to_numpy()].mean():>9.2f}"
+        cells = [f"{f['w'][np.asarray(season == s)].mean():>9.2f}"
                  if (season == s).sum() else f"{'-':>9}" for s in ORDER]
         print(f"{label:<20}" + "".join(cells) + f"{f['w'].mean():>9.2f}")
 
