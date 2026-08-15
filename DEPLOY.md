@@ -89,17 +89,37 @@ sudo -u weatherbot crontab -e
 ```cron
 SHELL=/bin/bash
 # Public sources only; no secrets. Adjust WEATHERBOT_* only if you moved things.
-*/30 * * * * cd /opt/weatherbot/app && flock -n /tmp/weatherbot.lock .venv/bin/python run_daily.py >> /opt/weatherbot/app/logs/cron.log 2>&1
+# Hours are UTC. See "the polling window" below for why this range and not 24/7.
+*/30 3-17 * * * cd /opt/weatherbot/app && flock -n /tmp/weatherbot.lock .venv/bin/python run_daily.py >> /opt/weatherbot/app/logs/cron.log 2>&1
 ```
 
 `flock -n` is what stops a slow run overlapping the next tick; without it a
 first-time cache build would be started several times at once.
 
-Why every 30 minutes rather than once a day: the upstream archives lag the live
-market. The Open-Meteo Single Runs API has not published a 00Z run an hour after
-it was issued, and NBM bulletins land a few hours late, so the forecast for
-today typically becomes available mid-morning US Eastern. Frequent polling picks
-it up as soon as it lands and captures price movement through the day.
+### The polling window
+
+The market settles on the maximum over a **local** calendar day at KLGA, so the
+window is bounded at both ends and is narrower than it looks.
+
+**It closes at 13:00 local** — `PEAK_LOCAL_HOUR` in `src/clv.py`. After the
+day's maximum has happened the market is pricing a known answer, so a snapshot
+records nothing. `clv.py log` refuses to log past that point, which is
+**17:00Z** during EDT and **18:00Z** during EST.
+
+**It opens whenever the 00Z ECMWF run is published**, and that lag is the
+awkward part. Measured against the Open-Meteo Single Runs archive: a 00Z run was
+still absent 3.2 hours after issue, while the previous day's 12Z run was
+available 13.2 hours after issue. So the run for today appears somewhere between
+**03:12Z and 13:12Z**. NBM's 00Z bulletin is faster — absent at 01:06Z, present
+by 03:10Z — so it is not the binding constraint.
+
+That gives a useful window of roughly **14 hours on a good day and under 4 on a
+bad one**. Polling every 30 minutes across 03:00Z-17:00Z covers both cases:
+runs before the forecast lands are cheap no-ops, and runs after 17:00Z are
+refused by the guard anyway. Under EST, shift to `4-18`.
+
+Runs outside the window are not harmful, just wasted — every one of them either
+finds no forecast or is refused by the peak guard.
 
 ### systemd timer instead of cron
 

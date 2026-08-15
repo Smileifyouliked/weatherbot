@@ -24,6 +24,22 @@ thin adaptation layer, not a KLGA pipeline: the underlying forecast fields are
 still interpolated to Central Park. A genuine KLGA build would re-pull ECMWF and
 NBM at LaGuardia and should beat it.
 
+WHEN A SNAPSHOT IS WORTH TAKING
+-------------------------------
+Prices are only logged for a target day while that day's maximum is still
+genuinely uncertain, i.e. before PEAK_LOCAL_HOUR local time. Past that the
+market has effectively seen the answer and quotes ~0 or ~1; recording those
+prices measures nothing and contaminates the CLV comparison with
+trivially-known outcomes. Rows captured before the guard existed are kept as a
+record but flagged `excluded`, never deleted.
+
+The binding constraint at the other end is publication lag. The ECMWF Single
+Runs archive had not published a 00Z run 3.2 hours after it was issued, while
+the previous 12Z run was available 13.2 hours after issue -- so the forecast for
+today lands somewhere in 03:12Z-13:12Z. NBM's 00Z bulletin is quicker, present
+by about 03:00Z. The useful polling window for a target local day therefore runs
+from whenever the 00Z run appears until 17:00Z (EDT) or 18:00Z (EST).
+
 MARKET STRUCTURE
 ----------------
 The event is not a single threshold. It is 11 mutually exclusive range buckets
@@ -84,6 +100,38 @@ PEAK_LOCAL_HOUR = 13
 
 def c_to_f(c):
     return np.asarray(c) * 9.0 / 5.0 + 32.0
+
+
+def hours_before_peak(stamp: pd.Timestamp, target: date) -> float:
+    """Hours from `stamp` until the target local day's likely maximum.
+
+    Negative once that moment has passed, which is when a price snapshot stops
+    carrying information about an uncertain outcome.
+    """
+    local = stamp.tz_convert(config.STATION_TZ)
+    peak = pd.Timestamp(target, tz=config.STATION_TZ) + pd.Timedelta(hours=PEAK_LOCAL_HOUR)
+    return float((peak - local).total_seconds() / 3600.0)
+
+
+def apply_exclusions(log: pd.DataFrame) -> pd.DataFrame:
+    """Mark rows that must not be scored, without deleting them.
+
+    Rows logged at or after the target day's likely maximum are kept as a record
+    of what was quoted, but flagged so scoring never counts them. Applied on
+    load so logs written before the guard existed are handled too.
+    """
+    if "excluded" not in log.columns:
+        log["excluded"] = False
+        log["exclude_reason"] = ""
+    log["excluded"] = log["excluded"].fillna(False).astype(bool)
+    log["exclude_reason"] = log["exclude_reason"].fillna("").astype(str)
+
+    if "hours_before_peak" in log.columns:
+        late = log["hours_before_peak"].fillna(-1.0) <= 0
+        newly = late & ~log["excluded"]
+        log.loc[newly, "excluded"] = True
+        log.loc[newly, "exclude_reason"] = f"logged after {PEAK_LOCAL_HOUR}:00 local"
+    return log
 
 
 def utcnow() -> pd.Timestamp:
@@ -311,6 +359,16 @@ def cmd_log(args) -> None:
             print(f"  {t}: event closed, skipped")
             continue
 
+        # Only snapshot while the outcome is still genuinely uncertain. Past the
+        # day's likely maximum the market has effectively seen the answer and
+        # prices sit at ~0 or ~1; logging that records no information and
+        # contaminates the CLV comparison with trivially-known outcomes.
+        hours_left = hours_before_peak(stamp, t)
+        if hours_left <= 0:
+            print(f"  {t}: past {PEAK_LOCAL_HOUR}:00 local "
+                  f"({-hours_left:.1f}h ago) -- max already determined, not logged")
+            continue
+
         mu = float(pred.loc[ts, "mu_f"])
         sigma = float(pred.loc[ts, "sigma_f"])
         mkts, failures = market_rows(event, t)
@@ -338,9 +396,9 @@ def cmd_log(args) -> None:
                 # Negative once the day is over.
                 "hours_to_close": float(
                     (day_start + pd.Timedelta(days=1) - local).total_seconds() / 3600.0),
-                "hours_before_peak": float(
-                    (day_start + pd.Timedelta(hours=PEAK_LOCAL_HOUR) - local)
-                    .total_seconds() / 3600.0),
+                "hours_before_peak": hours_left,
+                "excluded": False,
+                "exclude_reason": "",
             })
             rows.append(r)
         print(f"  {t}: {len(mkts)} buckets logged  (our mu {mu:.1f} F, "
@@ -370,7 +428,7 @@ def cmd_log(args) -> None:
 def cmd_resolve(args) -> None:
     if not LOG_PATH.exists():
         raise wxio.SourceError("no log to resolve")
-    log = pd.read_parquet(LOG_PATH)
+    log = apply_exclusions(pd.read_parquet(LOG_PATH))
     obs = klga_obs()
 
     if "outcome" not in log.columns:
@@ -417,7 +475,7 @@ def skill_str(ours: float, theirs: float) -> str:
 def cmd_score(args) -> None:
     if not LOG_PATH.exists():
         raise wxio.SourceError("no log to score")
-    log = pd.read_parquet(LOG_PATH)
+    log = apply_exclusions(pd.read_parquet(LOG_PATH))
     if "outcome" not in log.columns or log["outcome"].notna().sum() == 0:
         raise wxio.SourceError("no resolved rows yet; run 'resolve' after a market settles")
 
@@ -426,9 +484,9 @@ def cmd_score(args) -> None:
     dropped = len(resolved_all) - len(df)
 
     late = 0
-    if not args.include_late and "hours_before_peak" in df.columns:
-        late = int((df["hours_before_peak"] <= 0).sum())
-        df = df[df["hours_before_peak"] > 0]
+    if not args.include_late:
+        late = int(df["excluded"].sum())
+        df = df[~df["excluded"]]
         if df.empty:
             raise wxio.SourceError(
                 f"every resolved row was logged after {PEAK_LOCAL_HOUR}:00 local on "
