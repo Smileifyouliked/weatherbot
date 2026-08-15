@@ -10,8 +10,9 @@ Two things:
             reshape it instead of only shifting it.
 
   blend     ECMWF-MOS and NBM-PP combined. Inverse-variance weighting is the
-            starting point; a single fitted weight and four season-specific
-            weights are then tested against it.
+            default because it fits nothing and, at this sample size, fitted
+            weights do not pay for themselves: a single fitted weight and four
+            season-specific weights both score worse than it.
 
 Every weight is fitted walk-forward on data strictly before the target day's
 issue time (hard rules 1 and 2). The component predictions used to fit a weight
@@ -21,9 +22,13 @@ out-of-sample component output from days at or before D-2.
 A note on the blend's spread. Inverse-variance combination assumes independent
 estimates; these two forecasts see the same atmosphere and their errors are
 strongly correlated, so combining variances that way understates the true
-spread and yields an overconfident distribution. The weights therefore set the
-*mean* only, and the spread is refitted by maximum likelihood on the blended
-residuals -- which is what keeps the blend's PIT flat.
+spread badly. The weights therefore set the *mean* only, and the spread is
+refitted by maximum likelihood on the blended residuals.
+
+That refit still leaves the blend slightly underconfident out of sample (PIT
+variance ratio 0.93), so one further scalar sharpens it. See
+blend_walk_forward for why that scalar has to be fitted on a held-out tail of
+the training window rather than on all of it.
 
 Usage:
     python3 src/blend.py [--months 12]
@@ -65,6 +70,17 @@ MIN_BLEND_TRAIN = 120        # days before a blend weight is fitted at all
 MIN_SEASON_TRAIN = 45        # days of a season before it gets its own weight
 NOISE_FLOOR_CRPS = 0.05      # below this, a seasonal gain is not a gain
 
+# Inverse-variance weighting is the default: it fits nothing, and at this sample
+# size fitted weights do not pay for themselves (see CLAUDE.md rule 5a).
+DEFAULT_MODE = "invvar"
+
+# Held-out tail of the training window used to fit the spread scalar.
+HOLDOUT_FRAC = 0.25
+MIN_HOLDOUT_FIT = 60
+MIN_HOLDOUT_EVAL = 30
+# A calibration fix is not worth paying for beyond this in CRPS.
+INFLATION_COST_LIMIT = 0.02
+
 
 # --- components --------------------------------------------------------------
 
@@ -102,12 +118,24 @@ def fit_weight(y: np.ndarray, mu_a: np.ndarray, mu_b: np.ndarray) -> float:
 
 
 def blend_walk_forward(comp: pd.DataFrame, targets: pd.DatetimeIndex,
-                       mode: str) -> pd.DataFrame:
+                       mode: str, inflate: bool = False) -> pd.DataFrame:
     """Blend two component forecasts, refitting weights for every target day.
 
     mode: 'invvar'   inverse-variance weights, nothing fitted
           'fixed'    one weight fitted on the training window
           'seasonal' one weight per season, fitted on that season's training days
+
+    `inflate` applies one extra scalar to the predictive spread: c > 1 widens,
+    c < 1 sharpens. It is fitted on a held-out tail of the training window, not
+    on the whole of it.
+
+    That split is not incidental. The Gaussian log-sigma MLE carries an
+    intercept, so its first-order condition forces mean((r/s)^2) == 1 over the
+    rows it was fitted on. A scalar estimated from those same rows is therefore
+    identically 1.000 and cannot move calibration at all -- it is exactly
+    redundant with the intercept. Fitting it on residuals the spread model did
+    not see is what makes it a real parameter, and it is still fitted only on
+    data at or before the cutoff.
     """
     rows = []
     for D in targets:
@@ -160,9 +188,19 @@ def blend_walk_forward(comp: pd.DataFrame, targets: pd.DatetimeIndex,
         gamma = fit_log_sigma(Ztr_s, resid)
         sigma = float(predict_sigma(gamma, Zte_s)[0])
 
+        c = 1.0
+        if inflate:
+            k = int(len(train) * (1.0 - HOLDOUT_FRAC))
+            if k >= MIN_HOLDOUT_FIT and len(train) - k >= MIN_HOLDOUT_EVAL:
+                Za, Zb = _standardize(Ztr[:k], Ztr[k:])
+                g_early = fit_log_sigma(Za, resid[:k])
+                s_held = predict_sigma(g_early, Zb)
+                c = float(np.sqrt(np.mean((resid[k:] / s_held) ** 2)))
+                sigma *= c
+
         rows.append({"local_date": D, "mu": mu, "sigma": sigma,
                      "obs": float(here["obs"]), "w": w, "iv_w": float(iv_w),
-                     "n_train": len(train)})
+                     "c": c, "n_train": len(train)})
     return pd.DataFrame(rows).set_index("local_date")
 
 
@@ -230,14 +268,15 @@ def main() -> None:
     comp["sin_doy"] = np.sin(2 * np.pi * doy / 365.25)
     comp["cos_doy"] = np.cos(2 * np.pi * doy / 365.25)
 
-    bl_iv = blend_walk_forward(comp, targets, "invvar")
+    bl_iv = blend_walk_forward(comp, targets, DEFAULT_MODE)
+    bl_ivc = blend_walk_forward(comp, targets, DEFAULT_MODE, inflate=True)
     bl_fx = blend_walk_forward(comp, targets, "fixed")
     bl_se = blend_walk_forward(comp, targets, "seasonal")
     base = build_baselines(obs, fc_daily, targets)
 
     common = base.dropna(subset=["obs", "raw_mu", "raw_sigma", "clim_mu",
                                  "clim_sigma", "pers_mu", "pers_sigma"]).index
-    for frame in (mos, nbm_pp, bl_iv, bl_fx, bl_se):
+    for frame in (mos, nbm_pp, bl_iv, bl_ivc, bl_fx, bl_se):
         common = common.intersection(frame.index)
     nbm_raw = nbm.loc[nbm.index.intersection(common)]
     common = common.intersection(nbm_raw.index)
@@ -249,7 +288,8 @@ def main() -> None:
                                   "mu": nbm.loc[common, "nbm_tmax"],
                                   "sigma": nbm.loc[common, "xnd"].clip(lower=0.5)})),
         ("NBM post-processed", nbm_pp.loc[common]),
-        ("blend inv-var", bl_iv.loc[common]),
+        ("blend inv-var (default)", bl_iv.loc[common]),
+        ("blend + inflation", bl_ivc.loc[common]),
         ("blend fixed", bl_fx.loc[common]),
         ("blend seasonal", bl_se.loc[common]),
         ("raw deterministic", as_frame(base_c, "raw")),
@@ -269,18 +309,18 @@ def main() -> None:
     # --- main table ---
     print("\nAll units degrees F. Brier at exceedance thresholds. "
           "PIT = var(PIT)/uniform; 1.00 is calibrated.")
-    head = (f"{'model':<20}{'CRPS':>7}{'MAE':>7}{'PIT':>7}  "
+    head = (f"{'model':<24}{'CRPS':>7}{'MAE':>7}{'PIT':>7}  "
             + "".join(f"{'B'+str(t):>7}" for t in THRESHOLDS_F))
     print("\n" + head)
     print("-" * len(head))
     for label, s in scored:
-        print(f"{label:<20}{s['CRPS']:>7.2f}{s['MAE']:>7.2f}{s['PIT']:>7.2f}  "
+        print(f"{label:<24}{s['CRPS']:>7.2f}{s['MAE']:>7.2f}{s['PIT']:>7.2f}  "
               + "".join(f"{s['B'+str(t)]:>7.3f}" for t in THRESHOLDS_F))
 
     # --- seasonal ---
     season = common.month.map(SEASONS)
     print("\nCRPS by season (degrees F)")
-    head2 = f"{'model':<20}" + "".join(f"{s:>9}" for s in ORDER) + f"{'all':>9}"
+    head2 = f"{'model':<24}" + "".join(f"{s:>9}" for s in ORDER) + f"{'all':>9}"
     print("\n" + head2)
     print("-" * len(head2))
     for label, frame in rows:
@@ -288,20 +328,20 @@ def main() -> None:
         for s in ORDER:
             m = np.asarray(season == s)
             cells.append(f"{score(frame[m])['CRPS']:>9.2f}" if m.sum() else f"{'-':>9}")
-        print(f"{label:<20}" + "".join(cells) + f"{score(frame)['CRPS']:>9.2f}")
-    print(f"{'n days':<20}" + "".join(f"{int((season == s).sum()):>9}" for s in ORDER)
+        print(f"{label:<24}" + "".join(cells) + f"{score(frame)['CRPS']:>9.2f}")
+    print(f"{'n days':<24}" + "".join(f"{int((season == s).sum()):>9}" for s in ORDER)
           + f"{len(common):>9}")
 
     # --- weights ---
     print("\nFitted blend weights (share on ECMWF-MOS; 1.00 = MOS only)")
-    print(f"\n{'mode':<20}" + "".join(f"{s:>9}" for s in ORDER) + f"{'all':>9}")
-    print("-" * (20 + 9 * 5))
+    print(f"\n{'mode':<24}" + "".join(f"{s:>9}" for s in ORDER) + f"{'all':>9}")
+    print("-" * (24 + 9 * 5))
     for label, frame in (("inverse-variance", bl_iv), ("fixed", bl_fx),
                          ("seasonal", bl_se)):
         f = frame.loc[common]
         cells = [f"{f['w'][np.asarray(season == s)].mean():>9.2f}"
                  if (season == s).sum() else f"{'-':>9}" for s in ORDER]
-        print(f"{label:<20}" + "".join(cells) + f"{f['w'].mean():>9.2f}")
+        print(f"{label:<24}" + "".join(cells) + f"{f['w'].mean():>9.2f}")
 
     # --- overfitting verdict ---
     fx, se = score(bl_fx.loc[common])["CRPS"], score(bl_se.loc[common])["CRPS"]
@@ -316,6 +356,23 @@ def main() -> None:
         print(f"           and does not clear the floor. Prefer the fixed weight.")
     else:
         print(f"  VERDICT: seasonal weighting clears the floor.")
+
+    # --- spread inflation ---
+    before, after = score(bl_iv.loc[common]), score(bl_ivc.loc[common])
+    cost = after["CRPS"] - before["CRPS"]
+    print(f"\nSpread inflation on the default blend (one scalar)")
+    print(f"  before   CRPS {before['CRPS']:.3f}   PIT {before['PIT']:.3f}")
+    print(f"  after    CRPS {after['CRPS']:.3f}   PIT {after['PIT']:.3f}")
+    print(f"  cost     {cost:+.3f} F CRPS  (limit {INFLATION_COST_LIMIT:.2f})")
+    print(f"  mean c   {bl_ivc.loc[common, 'c'].mean():.3f}   "
+          f"(<1 sharpens, >1 widens)")
+    if abs(after["PIT"] - 1.0) < abs(before["PIT"] - 1.0) and cost <= INFLATION_COST_LIMIT:
+        print(f"  VERDICT: keep. Calibration improves and the CRPS cost is inside "
+              f"the limit.")
+    elif cost > INFLATION_COST_LIMIT:
+        print(f"  VERDICT: drop. The CRPS cost exceeds the limit.")
+    else:
+        print(f"  VERDICT: drop. Calibration does not improve.")
 
 
 if __name__ == "__main__":
