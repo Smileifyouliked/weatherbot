@@ -4,16 +4,77 @@ All times in this project are UTC internally (hard rule 6). The only place
 STATION_TZ is used is the daily-max resolution boundary in wxio.build_daily().
 """
 
+import argparse
+import os
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-# --- Station -----------------------------------------------------------------
-# KNYC = New York Central Park. "NYC" is the Iowa Environmental Mesonet ASOS id.
-STATION_ICAO = "KNYC"
-STATION_IEM_ID = "NYC"
-LATITUDE = 40.7790
-LONGITUDE = -73.9693
-STATION_TZ = "America/New_York"
+
+# --- Stations ----------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Station:
+    """One target station. Coordinates are from the IEM network metadata."""
+    icao: str
+    iem_id: str          # Iowa Environmental Mesonet id, and the NBM bulletin id
+    latitude: float
+    longitude: float
+    tz: str
+    iem_network: str
+    note: str = ""
+
+
+STATIONS: dict[str, Station] = {
+    "KNYC": Station("KNYC", "NYC", 40.7790, -73.9693, "America/New_York",
+                    "NY_ASOS", "Central Park; the original target"),
+    "KLGA": Station("KLGA", "LGA", 40.7794, -73.8803, "America/New_York",
+                    "NY_ASOS", "LaGuardia; what the Polymarket NYC market settles on"),
+}
+
+# Which station the modules act on when nothing says otherwise. Every entry
+# point takes --station, and WEATHERBOT_STATION overrides this default, so the
+# station is a parameter rather than a constant baked into the code.
+DEFAULT_STATION = os.environ.get("WEATHERBOT_STATION", "KNYC")
+
+BASE_DATA_DIR = Path(__file__).parent / "data"
+
+# Mutable view of the active station. use_station() rebinds these; modules read
+# them at call time rather than capturing them at import.
+STATION_ICAO = ""
+STATION_IEM_ID = ""
+LATITUDE = 0.0
+LONGITUDE = 0.0
+STATION_TZ = ""
+IEM_NETWORK = ""
+DATA_DIR = BASE_DATA_DIR
+RAW_HOURLY = BASE_DATA_DIR / "raw_hourly.parquet"
+DAILY = BASE_DATA_DIR / "daily.parquet"
+
+
+def use_station(name: str) -> Station:
+    """Point every module at `name`. Caches are per station, so switching is safe."""
+    global STATION_ICAO, STATION_IEM_ID, LATITUDE, LONGITUDE, STATION_TZ
+    global IEM_NETWORK, DATA_DIR, RAW_HOURLY, DAILY
+
+    key = name.upper()
+    if key not in STATIONS:
+        raise SystemExit(f"unknown station {name!r}; known: {', '.join(STATIONS)}")
+    s = STATIONS[key]
+    STATION_ICAO, STATION_IEM_ID = s.icao, s.iem_id
+    LATITUDE, LONGITUDE = s.latitude, s.longitude
+    STATION_TZ, IEM_NETWORK = s.tz, s.iem_network
+    DATA_DIR = BASE_DATA_DIR / s.icao
+    RAW_HOURLY = DATA_DIR / "raw_hourly.parquet"
+    DAILY = DATA_DIR / "daily.parquet"
+    return s
+
+
+def add_station_arg(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    ap.add_argument("--station", default=DEFAULT_STATION,
+                    choices=sorted(STATIONS),
+                    help=f"target station (default {DEFAULT_STATION})")
+    return ap
 
 # --- Backfill ranges ---------------------------------------------------------
 # Observations are cheap and carry no provenance problem, so they start earlier
@@ -54,13 +115,8 @@ SINGLE_RUNS_URL = "https://single-runs-api.open-meteo.com/v1/forecast"
 ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 IEM_ASOS_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
 IEM_DAILY_URL = "https://mesonet.agron.iastate.edu/api/1/daily.json"
-IEM_NETWORK = "NY_ASOS"
 
 # --- Cache (hard rule 5: every pull lands on disk as parquet) ----------------
-DATA_DIR = Path(__file__).parent / "data"
-RAW_HOURLY = DATA_DIR / "raw_hourly.parquet"
-DAILY = DATA_DIR / "daily.parquet"
-
 # A local day needs at least this many hourly values before a daily max is
 # trusted. Short days are dropped and counted, never filled (hard rule 7).
 MIN_HOURS_PER_DAY = 20
@@ -83,3 +139,6 @@ MAX_UNREACHABLE_FRACTION = 0.05
 # ...but only once enough runs were attempted for that fraction to mean
 # anything. On an incremental pull of a few days, one timeout is already 25%.
 MIN_RUNS_FOR_OUTAGE_CHECK = 20
+
+# Bind the default so importing config alone yields a usable configuration.
+use_station(DEFAULT_STATION)

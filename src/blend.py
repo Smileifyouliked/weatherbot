@@ -239,8 +239,10 @@ def as_frame(base: pd.DataFrame, key: str) -> pd.DataFrame:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    config.add_station_arg(ap)
     ap.add_argument("--months", type=int, default=12)
     args = ap.parse_args()
+    config.use_station(args.station)
 
     obs, fc_daily = load_daily(LEAD)
     ecmwf = build_features().join(obs.rename("obs"), how="inner").dropna(

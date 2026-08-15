@@ -254,6 +254,7 @@ def ingest_ensemble() -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    config.add_station_arg(ap)
     ap.add_argument("--start", type=date.fromisoformat, default=config.BACKBONE_START)
     ap.add_argument("--end", type=date.fromisoformat,
                     default=date.today() - timedelta(days=1))
@@ -265,6 +266,7 @@ def main() -> None:
     ap.add_argument("--skip-backbone", action="store_true")
     ap.add_argument("--skip-ensemble", action="store_true")
     args = ap.parse_args()
+    config.use_station(args.station)
     config.MAX_WORKERS = args.workers
     config.HTTP_TIMEOUT = args.timeout
 

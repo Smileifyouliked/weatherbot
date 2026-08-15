@@ -126,28 +126,35 @@ def already_logged_this_hour() -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--data-dir", type=Path,
-                    default=Path(os.environ.get("WEATHERBOT_DATA_DIR",
-                                                config.DATA_DIR)))
+                    default=(Path(os.environ["WEATHERBOT_DATA_DIR"])
+                             if os.environ.get("WEATHERBOT_DATA_DIR") else None),
+                    help="root of the per-station cache layout (data/<ICAO>/)")
     ap.add_argument("--log-dir", type=Path,
                     default=Path(os.environ.get("WEATHERBOT_LOG_DIR", REPO / "logs")))
     ap.add_argument("--force", action="store_true",
                     help="run even if this hour already has a snapshot")
     args = ap.parse_args()
 
-    config.DATA_DIR = args.data_dir
-    config.RAW_HOURLY = args.data_dir / "raw_hourly.parquet"
-    config.DAILY = args.data_dir / "daily.parquet"
+    # Override the root of the per-station cache layout, not a single station's
+    # directory: config derives data/<ICAO>/ from this.
+    if args.data_dir is not None:
+        config.BASE_DATA_DIR = args.data_dir
 
     log_path = setup_logging(args.log_dir)
     started = datetime.now(timezone.utc)
-    LOG.info("run_daily start  station=%s  data=%s  log=%s",
-             config.STATION_ICAO, args.data_dir, log_path)
 
     # Imported after config paths are set, since these resolve them at import.
     import clv  # noqa: E402
     import wxio  # noqa: E402
-    clv.PRED_PATH = args.data_dir / "clv_pred.parquet"
-    clv.LOG_PATH = args.data_dir / "clv_log.parquet"
+
+    # The market settles on KLGA, so that -- not the project's original KNYC --
+    # is the station this job forecasts. Name it plainly: an earlier header said
+    # "station=KNYC" above a KLGA forecast line, which read like a bug.
+    market = config.use_station(clv.MARKET_STATION_ICAO)
+    clv.PRED_PATH = config.DATA_DIR / "clv_pred.parquet"
+    clv.LOG_PATH = config.DATA_DIR / "clv_log.parquet"
+    LOG.info("run_daily start  market station=%s (%s)  data=%s  log=%s",
+             market.icao, market.note, config.DATA_DIR, log_path)
 
     if not args.force and already_logged_this_hour():
         LOG.info("a snapshot already exists for this UTC hour; nothing to do")
@@ -162,13 +169,14 @@ def main() -> int:
     #    the next run backfills.
     def pull_ecmwf():
         import ingest_forecast
-        sys.argv = ["ingest_forecast", "--skip-ensemble",
+        sys.argv = ["ingest_forecast", "--station", market.icao, "--skip-ensemble",
                     "--end", today.isoformat(), "--workers", "3", "--timeout", "90"]
         ingest_forecast.main()
 
     def pull_nbm():
         import ingest_nbm
-        sys.argv = ["ingest_nbm", "--start", (today - timedelta(days=2)).isoformat(),
+        sys.argv = ["ingest_nbm", "--station", market.icao,
+                    "--start", (today - timedelta(days=2)).isoformat(),
                     "--end", today.isoformat()]
         ingest_nbm.main()
 

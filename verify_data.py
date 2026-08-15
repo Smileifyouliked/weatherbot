@@ -10,6 +10,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import sys
 
 import pandas as pd
@@ -37,6 +38,10 @@ def warn(label: str, detail: str = "") -> None:
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description="Verify the caches for one station.")
+    config.add_station_arg(ap)
+    config.use_station(ap.parse_args().station)
+
     if not config.RAW_HOURLY.exists():
         print(f"FAIL: {config.RAW_HOURLY} does not exist. Run the ingestion modules.")
         return 1

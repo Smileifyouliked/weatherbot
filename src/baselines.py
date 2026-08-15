@@ -209,11 +209,13 @@ def check_no_leakage(obs: pd.Series, fc: pd.Series, targets: pd.DatetimeIndex,
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    config.add_station_arg(ap)
     ap.add_argument("--months", type=int, default=12)
     ap.add_argument("--lead", type=int, default=1)
     ap.add_argument("--check", action="store_true",
                     help="verify no future data reaches any baseline, then exit")
     args = ap.parse_args()
+    config.use_station(args.station)
 
     obs, fc = load(args.lead)
 
