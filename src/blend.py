@@ -74,6 +74,12 @@ NOISE_FLOOR_CRPS = 0.05      # below this, a seasonal gain is not a gain
 # size fitted weights do not pay for themselves (see CLAUDE.md rule 5a).
 DEFAULT_MODE = "invvar"
 
+# The default blend also carries the spread scalar. Without it the blend is
+# underconfident (PIT variance ratio 0.93); with it PIT is 1.02 for +0.003 CRPS.
+# This project exists to emit calibrated distributions, so that trade is worth
+# making (CLAUDE.md rule 5b).
+DEFAULT_INFLATE = True
+
 # Held-out tail of the training window used to fit the spread scalar.
 HOLDOUT_FRAC = 0.25
 MIN_HOLDOUT_FIT = 60
@@ -268,8 +274,10 @@ def main() -> None:
     comp["sin_doy"] = np.sin(2 * np.pi * doy / 365.25)
     comp["cos_doy"] = np.cos(2 * np.pi * doy / 365.25)
 
-    bl_iv = blend_walk_forward(comp, targets, DEFAULT_MODE)
-    bl_ivc = blend_walk_forward(comp, targets, DEFAULT_MODE, inflate=True)
+    # The default carries the spread scalar; the uninflated variant is kept
+    # alongside it so the calibration cost of that one parameter stays visible.
+    bl_ivc = blend_walk_forward(comp, targets, DEFAULT_MODE, inflate=DEFAULT_INFLATE)
+    bl_iv = blend_walk_forward(comp, targets, DEFAULT_MODE, inflate=False)
     bl_fx = blend_walk_forward(comp, targets, "fixed")
     bl_se = blend_walk_forward(comp, targets, "seasonal")
     base = build_baselines(obs, fc_daily, targets)
@@ -288,8 +296,8 @@ def main() -> None:
                                   "mu": nbm.loc[common, "nbm_tmax"],
                                   "sigma": nbm.loc[common, "xnd"].clip(lower=0.5)})),
         ("NBM post-processed", nbm_pp.loc[common]),
-        ("blend inv-var (default)", bl_iv.loc[common]),
-        ("blend + inflation", bl_ivc.loc[common]),
+        ("blend (default)", bl_ivc.loc[common]),
+        ("blend, no inflation", bl_iv.loc[common]),
         ("blend fixed", bl_fx.loc[common]),
         ("blend seasonal", bl_se.loc[common]),
         ("raw deterministic", as_frame(base_c, "raw")),
@@ -360,14 +368,14 @@ def main() -> None:
     # --- spread inflation ---
     before, after = score(bl_iv.loc[common]), score(bl_ivc.loc[common])
     cost = after["CRPS"] - before["CRPS"]
-    print(f"\nSpread inflation on the default blend (one scalar)")
+    print(f"\nSpread inflation (one scalar, ON by default)")
     print(f"  before   CRPS {before['CRPS']:.3f}   PIT {before['PIT']:.3f}")
     print(f"  after    CRPS {after['CRPS']:.3f}   PIT {after['PIT']:.3f}")
     print(f"  cost     {cost:+.3f} F CRPS  (limit {INFLATION_COST_LIMIT:.2f})")
     print(f"  mean c   {bl_ivc.loc[common, 'c'].mean():.3f}   "
           f"(<1 sharpens, >1 widens)")
     if abs(after["PIT"] - 1.0) < abs(before["PIT"] - 1.0) and cost <= INFLATION_COST_LIMIT:
-        print(f"  VERDICT: keep. Calibration improves and the CRPS cost is inside "
+        print(f"  VERDICT: on. Calibration improves and the CRPS cost is inside "
               f"the limit.")
     elif cost > INFLATION_COST_LIMIT:
         print(f"  VERDICT: drop. The CRPS cost exceeds the limit.")

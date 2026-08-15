@@ -1,0 +1,23 @@
+# Pinned to the versions this project has actually been run against.
+# Verified on Python 3.11.15 / Ubuntu 24.04.
+#
+# Install:  pip install -r requirements.txt
+
+# Core: dataframes and the parquet caches.
+pandas==3.0.5
+pyarrow==25.0.1
+numpy==2.4.6
+
+# HTTP for every source (Open-Meteo, NOAA S3, Iowa Mesonet, Polymarket Gamma).
+requests==2.33.1
+
+# Pulled in by the above; pinned so a rebuild is reproducible.
+python-dateutil==2.9.0.post0
+urllib3==2.6.3
+certifi==2026.2.25
+charset-normalizer==3.4.6
+idna==3.11
+
+# Only needed for the PIT histogram written by src/mos.py. The daily job does
+# not import it, so a headless deployment can drop this line.
+matplotlib==3.11.1

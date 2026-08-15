@@ -10,6 +10,9 @@ data/*
 # stay ignored by the data/* rule above. On a host where the log must survive,
 # back up the data directory rather than committing it -- see DEPLOY.md.
 
+# Runtime output of the unattended job.
+logs/
+
 __pycache__/
 *.pyc
 .venv/
