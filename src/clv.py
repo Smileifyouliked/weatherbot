@@ -124,31 +124,40 @@ def fetch_event(target: date) -> dict | None:
     return payload[0] if isinstance(payload, list) else payload
 
 
-def market_rows(event: dict, target: date) -> list[dict]:
-    """One row per bucket, with best bid/ask and a mid where both sides exist."""
-    out = []
+def market_rows(event: dict, target: date) -> tuple[list[dict], list[str]]:
+    """One row per bucket, with best bid/ask and a mid where both sides exist.
+
+    Each market is parsed independently: one malformed or unexpected entry is
+    skipped and reported, never allowed to lose the rest of the event. Returns
+    (rows, failures).
+    """
+    out, failures = [], []
     for m in event.get("markets", []):
         q = m.get("question") or ""
-        bounds = parse_bucket(q)
-        if bounds is None:
-            continue
-        bid = m.get("bestBid")
-        ask = m.get("bestAsk")
-        bid = float(bid) if bid is not None else np.nan
-        ask = float(ask) if ask is not None else np.nan
-        # Mid only where both sides are quoted; a one-sided book has no mid, and
-        # substituting last-trade would silently mix two different quantities.
-        mid = (bid + ask) / 2.0 if np.isfinite(bid) and np.isfinite(ask) else np.nan
-        last = m.get("lastTradePrice")
-        out.append({
-            "target_date": pd.Timestamp(target),
-            "market_id": str(m.get("id")),
-            "question": q,
-            "lo_f": bounds[0], "hi_f": bounds[1],
-            "bid": bid, "ask": ask, "mid": mid,
-            "last": float(last) if last is not None else np.nan,
-        })
-    return out
+        try:
+            bounds = parse_bucket(q)
+            if bounds is None:
+                failures.append(f"unparseable bucket: {q[:70]!r}")
+                continue
+            bid = m.get("bestBid")
+            ask = m.get("bestAsk")
+            bid = float(bid) if bid is not None else np.nan
+            ask = float(ask) if ask is not None else np.nan
+            # Mid only where both sides are quoted; a one-sided book has no mid,
+            # and substituting last-trade would silently mix two quantities.
+            mid = (bid + ask) / 2.0 if np.isfinite(bid) and np.isfinite(ask) else np.nan
+            last = m.get("lastTradePrice")
+            out.append({
+                "target_date": pd.Timestamp(target),
+                "market_id": str(m.get("id")),
+                "question": q,
+                "lo_f": bounds[0], "hi_f": bounds[1],
+                "bid": bid, "ask": ask, "mid": mid,
+                "last": float(last) if last is not None else np.nan,
+            })
+        except (TypeError, ValueError, KeyError) as exc:
+            failures.append(f"{q[:50]!r}: {type(exc).__name__}: {exc}")
+    return out, failures
 
 
 # --- prediction --------------------------------------------------------------
@@ -304,7 +313,9 @@ def cmd_log(args) -> None:
 
         mu = float(pred.loc[ts, "mu_f"])
         sigma = float(pred.loc[ts, "sigma_f"])
-        mkts = market_rows(event, t)
+        mkts, failures = market_rows(event, t)
+        for why in failures:
+            print(f"  {t}: skipped a market -- {why}")
         for r in mkts:
             p = float(_Phi((r["hi_f"] - mu) / sigma) - _Phi((r["lo_f"] - mu) / sigma))
             # Distance from our mean, in sigmas. The end buckets are open on one
@@ -332,7 +343,8 @@ def cmd_log(args) -> None:
                     .total_seconds() / 3600.0),
             })
             rows.append(r)
-        print(f"  {t}: {len(mkts)} buckets logged  (our mu {mu:.1f} F, sigma {sigma:.2f})")
+        print(f"  {t}: {len(mkts)} buckets logged  (our mu {mu:.1f} F, "
+              f"sigma {sigma:.2f}){f', {len(failures)} skipped' if failures else ''}")
 
     if not rows:
         print("  nothing to log")
