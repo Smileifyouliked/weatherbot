@@ -5,6 +5,10 @@
 data/*
 !data/raw_hourly.parquet
 !data/daily.parquet
+# data/clv_log.parquet and data/clv_pred.parquet are deliberately NOT listed
+# here: they are runtime output of the daily job, not repository content. They
+# stay ignored by the data/* rule above. On a host where the log must survive,
+# back up the data directory rather than committing it -- see DEPLOY.md.
 
 __pycache__/
 *.pyc
