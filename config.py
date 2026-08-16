@@ -101,6 +101,17 @@ if not 0.5 < DETERMINED_QUANTILE < 1.0:
     raise SystemExit(f"WEATHERBOT_DETERMINED_QUANTILE must be in (0.5, 1.0), "
                      f"got {DETERMINED_QUANTILE}")
 
+# --- Unattended run cadence --------------------------------------------------
+# Minimum gap between price snapshots. run_daily.py exits early if the last
+# snapshot is newer than this, which protects against a double-fire or two cron
+# invocations overlapping.
+#
+# It is a floor, not a cap: it must stay below the cron interval or it silently
+# throttles the schedule. An earlier version skipped anything already logged in
+# the current UTC hour, which quietly halved a */30 cron to hourly -- 30,380
+# clean rows a year instead of 60,227, for no stated reason.
+MIN_RUN_INTERVAL_MIN = float(os.environ.get("WEATHERBOT_MIN_RUN_INTERVAL_MIN", "25"))
+
 # --- Backfill ranges ---------------------------------------------------------
 # Observations are cheap and carry no provenance problem, so they start earlier
 # than the forecast backbone to give climatology/persistence baselines a runway.
