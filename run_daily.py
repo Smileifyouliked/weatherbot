@@ -12,13 +12,14 @@ reads an API key, because none of the sources used require one.
 Exit codes
     0  every stage either succeeded or was a documented no-op
     1  at least one stage failed
-    2  the run was skipped because a snapshot already exists for this hour
+    2  the run was skipped because the last snapshot is too recent
 
 Design notes for unattended use
 -------------------------------
-Idempotent within the hour. A snapshot already logged in the current UTC hour
-makes the run exit 2 without touching anything, so a cron every 15 minutes and a
-cron every hour behave the same. --force overrides.
+A snapshot newer than config.MIN_RUN_INTERVAL_MIN makes the run exit 2 without
+touching anything, so a double-fire or two overlapping cron invocations cannot
+double-log. It is a floor on the gap between snapshots, not a cap on cadence:
+keep it below the cron interval or it throttles the schedule. --force overrides.
 
 Partial failure is expected, not exceptional. Upstream archives lag the live
 market: the Open-Meteo Single Runs API has not published a 00Z run an hour after
@@ -109,18 +110,20 @@ class Stage:
             return None
 
 
-def already_logged_this_hour() -> bool:
-    """True when a price snapshot for the current UTC hour is already on disk."""
+def minutes_since_last_snapshot() -> float | None:
+    """Age of the newest price snapshot on disk, or None if there is none."""
     import pandas as pd
     from clv import LOG_PATH
 
     if not LOG_PATH.exists():
-        return False
+        return None
     log = pd.read_parquet(LOG_PATH, columns=["logged_at"])
     if log.empty:
-        return False
-    hour = pd.Timestamp(datetime.now(timezone.utc)).floor("h")
-    return bool((log["logged_at"].dt.floor("h") == hour).any())
+        return None
+    last = pd.Timestamp(log["logged_at"].max())
+    if last.tzinfo is None:
+        last = last.tz_localize("UTC")
+    return (pd.Timestamp(datetime.now(timezone.utc)) - last).total_seconds() / 60.0
 
 
 def main() -> int:
@@ -156,8 +159,10 @@ def main() -> int:
     LOG.info("run_daily start  market station=%s (%s)  data=%s  log=%s",
              market.icao, market.note, config.DATA_DIR, log_path)
 
-    if not args.force and already_logged_this_hour():
-        LOG.info("a snapshot already exists for this UTC hour; nothing to do")
+    age = None if args.force else minutes_since_last_snapshot()
+    if age is not None and age < config.MIN_RUN_INTERVAL_MIN:
+        LOG.info("last snapshot was %.1f min ago, under the %.0f min minimum; "
+                 "nothing to do", age, config.MIN_RUN_INTERVAL_MIN)
         LOG.info("run_daily skipped (use --force to override)")
         return 2
 
