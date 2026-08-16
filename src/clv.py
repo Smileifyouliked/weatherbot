@@ -94,6 +94,10 @@ HOLDOUT_FRAC = 0.25
 DISTANCE_BINS = [0.0, 0.5, 1.0, 2.0, np.inf]
 DISTANCE_LABELS = ["<0.5s (centre)", "0.5-1s", "1-2s", ">2s (tail)"]
 
+# Minimum edge over the *quoted* price before the P&L simulation takes a
+# position. Below the typical spread on these buckets there is nothing to take.
+DEFAULT_EDGE = 0.05
+
 # Local hour by which the daily maximum has usually happened, per season. Past
 # it a snapshot is scoring a near-known outcome, which flatters the market and
 # tells us nothing about forecast skill; such rows are logged but excluded from
@@ -683,6 +687,9 @@ def cmd_score(args) -> None:
         print(f"  highly dependent, so the effective sample is nearer {days} than "
               f"{len(df)}.")
 
+    if getattr(args, "pnl", False):
+        pnl_report(log, args.edge, args.stake, args.include_late)
+
 
 def hourly_history(start_year: int = 2019) -> pd.DataFrame:
     """Every reported temperature at the market station, in station-local time.
@@ -835,6 +842,105 @@ def simulate_override(hourly: pd.DataFrame, peak: pd.DataFrame,
     return {"frame": pd.DataFrame(rows), "z": z}
 
 
+def pnl_report(log: pd.DataFrame, edge: float, stake: float,
+               include_late: bool) -> None:
+    """Notional P&L from the logged quotes, filled at the price actually offered.
+
+    This is a simulation of betting, not a record of one. It is deliberately
+    pessimistic in the one place backtests usually cheat: **fills are at the ask
+    to go long and at the bid to go short, never at the mid.** You cannot trade
+    at the mid. On these buckets the spread is often 3-6 cents against an edge of
+    similar size, so a mid-filled P&L can show a profit that does not survive
+    contact with the book. The spread cost is printed explicitly so the size of
+    that difference is visible rather than assumed away.
+
+    Two sides, both executable at quoted prices:
+      long YES  -- pay `ask`,     collect 1 if the bucket contains the max
+      long NO   -- pay `1 - bid`, collect 1 if it does not
+    They are mutually exclusive: qualifying on both would need bid > ask.
+
+    One entry per bucket per day, at the first snapshot where the edge appears,
+    which is what acting on a signal looks like. Holding to resolution means no
+    exit assumption is needed.
+    """
+    df = log[log["outcome"].notna()].copy()
+    if not include_late:
+        df = df[~df["excluded"]]
+    if df.empty:
+        print("\nNo resolved rows to simulate against.")
+        return
+
+    df = df.sort_values("logged_at")
+    yes = df[df["ask"].notna() & (df["our_p"] - df["ask"] >= edge)].copy()
+    yes["side"] = "YES"
+    yes["price"] = yes["ask"]
+    yes["won"] = yes["outcome"]
+
+    no = df[df["bid"].notna() & (df["bid"] - df["our_p"] >= edge)].copy()
+    no["side"] = "NO"
+    no["price"] = 1.0 - no["bid"]
+    no["won"] = 1.0 - no["outcome"]
+
+    trades = pd.concat([yes, no], ignore_index=True)
+    if trades.empty:
+        print(f"\nNo bucket ever showed an edge of {edge:.0%} or more against the "
+              f"quoted price.")
+        print("  That is a result, not a failure: it says the market was never "
+              "far enough")
+        print("  from our number to be worth taking at the spread on offer.")
+        return
+
+    # First qualifying snapshot per bucket per day -- one entry, not one per poll.
+    trades = (trades.sort_values("logged_at")
+              .groupby(["target_date", "market_id", "side"], as_index=False).first())
+
+    trades["pnl"] = stake * (trades["won"] - trades["price"])
+    staked = float((trades["price"] * stake).sum())
+    pnl = float(trades["pnl"].sum())
+
+    # The same trades filled at the mid, which is what a careless backtest would
+    # report. The gap is the spread, and it is the whole reason to fill at ask.
+    mid_ok = trades["mid"].notna()
+    mid_price = np.where(trades["side"] == "YES", trades["mid"], 1.0 - trades["mid"])
+    pnl_mid = float((stake * (trades["won"] - mid_price))[mid_ok].sum())
+    staked_mid = float((mid_price * stake)[mid_ok].sum())
+
+    print(f"\n\nNotional P&L  (edge >= {edge:.0%}, {stake:g} share per bucket, "
+          f"held to resolution)")
+    print("-" * 66)
+    print(f"trades        : {len(trades)} across "
+          f"{trades['target_date'].nunique()} day(s)   "
+          f"[{int((trades['side'] == 'YES').sum())} YES, "
+          f"{int((trades['side'] == 'NO').sum())} NO]")
+    print(f"hit rate      : {trades['won'].mean():.1%}")
+    print(f"staked        : {staked:.2f}")
+    print(f"P&L           : {pnl:+.2f}   ({pnl / staked:+.1%} on stake)")
+    if mid_ok.any():
+        print(f"  same trades filled at mid : {pnl_mid:+.2f} "
+              f"({pnl_mid / staked_mid:+.1%})  <- not achievable")
+        print(f"  spread cost               : {pnl_mid - pnl:.2f} over "
+              f"{int(mid_ok.sum())} trades")
+
+    for side in ("YES", "NO"):
+        g = trades[trades["side"] == side]
+        if g.empty:
+            continue
+        s = float((g["price"] * stake).sum())
+        print(f"  {side:<4}: {len(g):>4} trades  hit {g['won'].mean():>5.1%}  "
+              f"staked {s:>7.2f}  P&L {g['pnl'].sum():>+7.2f}  "
+              f"({g['pnl'].sum() / s:+.1%})")
+
+    days = trades["target_date"].nunique()
+    if days < 30:
+        print(f"\n  NOTE: {days} day(s). This number is not evidence of anything "
+              f"yet -- the")
+        print("  buckets within a day resolve together, so the effective sample "
+              "is the")
+        print(f"  day count, not the trade count. Positive or negative, treat it "
+              f"as noise")
+        print("  until there are ~30 days.")
+
+
 def cmd_cutoffs(args) -> None:
     """Score the cutoffs the way the logger actually runs: per row, not per day.
 
@@ -924,6 +1030,13 @@ def main() -> None:
         if name == "score":
             sp.add_argument("--include-late", action="store_true",
                             help="also score snapshots taken after the daily max")
+            sp.add_argument("--pnl", action="store_true",
+                            help="also simulate notional P&L, filled at ask/bid")
+            sp.add_argument("--edge", type=float, default=DEFAULT_EDGE,
+                            help=f"minimum edge over the quoted price to take a "
+                                 f"position (default {DEFAULT_EDGE:.2f})")
+            sp.add_argument("--stake", type=float, default=1.0,
+                            help="shares per qualifying bucket (default 1)")
         if name == "predict":
             sp.add_argument("--date", type=date.fromisoformat, default=None,
                             help="single target day instead of the default window")
