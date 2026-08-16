@@ -98,6 +98,13 @@ DISTANCE_LABELS = ["<0.5s (centre)", "0.5-1s", "1-2s", ">2s (tail)"]
 # position. Below the typical spread on these buckets there is nothing to take.
 DEFAULT_EDGE = 0.05
 
+# Resolved days required before a P&L figure is printed at all. The buckets
+# within a day resolve together, so the effective sample is the day count, not
+# the trade count -- and a P&L number reads as a result in a way a Brier score
+# does not, so it is withheld rather than merely caveated. Stricter than the
+# 30-day note on the Brier/CLV output, deliberately.
+MIN_PNL_DAYS = 100
+
 # Local hour by which the daily maximum has usually happened, per season. Past
 # it a snapshot is scoring a near-known outcome, which flatters the market and
 # tells us nothing about forecast skill; such rows are logged but excluded from
@@ -602,6 +609,11 @@ def skill_str(ours: float, theirs: float) -> str:
 
 
 def cmd_score(args) -> None:
+    # Validated before anything is read, so a bad flag fails immediately rather
+    # than partway through a report.
+    if getattr(args, "pnl", False):
+        validate_pnl_args(args.edge, args.stake)
+
     if not LOG_PATH.exists():
         raise wxio.SourceError("no log to score")
     log = apply_exclusions(pd.read_parquet(LOG_PATH))
@@ -609,8 +621,24 @@ def cmd_score(args) -> None:
         raise wxio.SourceError("no resolved rows yet; run 'resolve' after a market settles")
 
     resolved_all = log[log["outcome"].notna()]
+
+    # Ahead of every mid-dependent abort below: the P&L fills at ask and bid and
+    # needs no mid at all, so a log of entirely one-sided books -- the normal
+    # state for deep out-of-the-money buckets -- must not suppress it.
+    if getattr(args, "pnl", False):
+        pnl_report(log, args.edge, args.stake, args.include_late)
+
     df = resolved_all[resolved_all["mid"].notna()].copy()
     dropped = len(resolved_all) - len(df)
+
+    # Tested before the late filter, so that "no two-sided book" is reported as
+    # itself. Folded in after, an all-one-sided log emptied df and was blamed on
+    # the cutoff instead -- a diagnostic pointing at the wrong cause.
+    if df.empty:
+        raise wxio.SourceError(
+            f"{len(resolved_all)} resolved rows but none has a two-sided book, so "
+            f"no mid price exists to score against. Deep out-of-the-money buckets "
+            f"are usually quoted ask-only.")
 
     late = 0
     if not args.include_late:
@@ -623,11 +651,6 @@ def cmd_score(args) -> None:
                 f"its target day, when the maximum has usually already happened and "
                 f"the market prices a near-known outcome. Scoring those would "
                 f"measure nothing. Use --include-late to override.")
-    if df.empty:
-        raise wxio.SourceError(
-            f"{len(resolved_all)} resolved rows but none has a two-sided book, so "
-            f"no mid price exists to score against. Deep out-of-the-money buckets "
-            f"are usually quoted ask-only.")
 
     # Closing price per market = the last mid we logged before resolution.
     close = (df.sort_values("logged_at").groupby("market_id")["mid"].last()
@@ -686,9 +709,6 @@ def cmd_score(args) -> None:
         print(f"  interpretable at this sample size -- the buckets within a day are")
         print(f"  highly dependent, so the effective sample is nearer {days} than "
               f"{len(df)}.")
-
-    if getattr(args, "pnl", False):
-        pnl_report(log, args.edge, args.stake, args.include_late)
 
 
 def hourly_history(start_year: int = 2019) -> pd.DataFrame:
@@ -842,6 +862,20 @@ def simulate_override(hourly: pd.DataFrame, peak: pd.DataFrame,
     return {"frame": pd.DataFrame(rows), "z": z}
 
 
+def validate_pnl_args(edge: float, stake: float) -> None:
+    """Reject nonsense before any data is read.
+
+    A zero stake divides by zero halfway through the report; a negative edge
+    makes every row qualify on both sides at once, which is not a strategy.
+    """
+    if stake <= 0:
+        raise SystemExit(f"--stake must be positive, got {stake:g}")
+    if edge < 0:
+        raise SystemExit(
+            f"--edge must be zero or positive, got {edge:g}. A negative edge "
+            f"takes positions the quoted price already argues against.")
+
+
 def pnl_report(log: pd.DataFrame, edge: float, stake: float,
                include_late: bool) -> None:
     """Notional P&L from the logged quotes, filled at the price actually offered.
@@ -851,23 +885,46 @@ def pnl_report(log: pd.DataFrame, edge: float, stake: float,
     to go long and at the bid to go short, never at the mid.** You cannot trade
     at the mid. On these buckets the spread is often 3-6 cents against an edge of
     similar size, so a mid-filled P&L can show a profit that does not survive
-    contact with the book. The spread cost is printed explicitly so the size of
-    that difference is visible rather than assumed away.
+    contact with the book.
 
     Two sides, both executable at quoted prices:
       long YES  -- pay `ask`,     collect 1 if the bucket contains the max
       long NO   -- pay `1 - bid`, collect 1 if it does not
-    They are mutually exclusive: qualifying on both would need bid > ask.
 
-    One entry per bucket per day, at the first snapshot where the edge appears,
-    which is what acting on a signal looks like. Holding to resolution means no
-    exit assumption is needed.
+    One entry per bucket per day, at the first snapshot where either side shows
+    the edge. The two sides cannot both qualify *within one snapshot* -- that
+    would need bid > ask -- but they can qualify at different times of day as
+    our number and the quotes both move, so the entry is deduplicated on
+    (day, bucket) alone. Booking both sides on one bucket is not a hedge, it is
+    paying two spreads for a payoff of exactly 1.
+
+    Holding to resolution means no exit assumption is needed.
+
+    LIMITATION -- top of book only. The quotes carry a price and no size, so
+    every fill here assumes the full stake trades at the best price. It does
+    not. Any real order walks the book and fills worse, and these markets are
+    thin. Read the result as an upper bound at one share, not as a P&L
+    achievable at size.
     """
+    validate_pnl_args(edge, stake)
+
     df = log[log["outcome"].notna()].copy()
     if not include_late:
         df = df[~df["excluded"]]
     if df.empty:
         print("\nNo resolved rows to simulate against.")
+        return
+
+    resolved_days = int(df["target_date"].nunique())
+    if resolved_days < MIN_PNL_DAYS:
+        print(f"\n\nNotional P&L: withheld. {resolved_days} resolved day(s) in the "
+              f"log, {MIN_PNL_DAYS} required.")
+        print(f"  The buckets within a day resolve together, so the effective "
+              f"sample is the")
+        print(f"  day count. Below {MIN_PNL_DAYS} days a P&L figure is noise that "
+              f"reads like a result,")
+        print("  which is worse than no figure at all. "
+              f"{MIN_PNL_DAYS - resolved_days} to go.")
         return
 
     df = df.sort_values("logged_at")
@@ -890,20 +947,16 @@ def pnl_report(log: pd.DataFrame, edge: float, stake: float,
         print("  from our number to be worth taking at the spread on offer.")
         return
 
-    # First qualifying snapshot per bucket per day -- one entry, not one per poll.
+    # One entry per bucket per day, from ONE snapshot. drop_duplicates keeps a
+    # whole row; groupby().first() would take the first non-null of each column
+    # independently and assemble a row that never existed -- a price from 08:00
+    # beside a mid from 12:00, which invents a spread out of nothing.
     trades = (trades.sort_values("logged_at")
-              .groupby(["target_date", "market_id", "side"], as_index=False).first())
+              .drop_duplicates(subset=["target_date", "market_id"], keep="first"))
 
     trades["pnl"] = stake * (trades["won"] - trades["price"])
     staked = float((trades["price"] * stake).sum())
     pnl = float(trades["pnl"].sum())
-
-    # The same trades filled at the mid, which is what a careless backtest would
-    # report. The gap is the spread, and it is the whole reason to fill at ask.
-    mid_ok = trades["mid"].notna()
-    mid_price = np.where(trades["side"] == "YES", trades["mid"], 1.0 - trades["mid"])
-    pnl_mid = float((stake * (trades["won"] - mid_price))[mid_ok].sum())
-    staked_mid = float((mid_price * stake)[mid_ok].sum())
 
     print(f"\n\nNotional P&L  (edge >= {edge:.0%}, {stake:g} share per bucket, "
           f"held to resolution)")
@@ -915,11 +968,6 @@ def pnl_report(log: pd.DataFrame, edge: float, stake: float,
     print(f"hit rate      : {trades['won'].mean():.1%}")
     print(f"staked        : {staked:.2f}")
     print(f"P&L           : {pnl:+.2f}   ({pnl / staked:+.1%} on stake)")
-    if mid_ok.any():
-        print(f"  same trades filled at mid : {pnl_mid:+.2f} "
-              f"({pnl_mid / staked_mid:+.1%})  <- not achievable")
-        print(f"  spread cost               : {pnl_mid - pnl:.2f} over "
-              f"{int(mid_ok.sum())} trades")
 
     for side in ("YES", "NO"):
         g = trades[trades["side"] == side]
@@ -930,15 +978,30 @@ def pnl_report(log: pd.DataFrame, edge: float, stake: float,
               f"staked {s:>7.2f}  P&L {g['pnl'].sum():>+7.2f}  "
               f"({g['pnl'].sum() / s:+.1%})")
 
-    days = trades["target_date"].nunique()
-    if days < 30:
-        print(f"\n  NOTE: {days} day(s). This number is not evidence of anything "
-              f"yet -- the")
-        print("  buckets within a day resolve together, so the effective sample "
-              "is the")
-        print(f"  day count, not the trade count. Positive or negative, treat it "
-              f"as noise")
-        print("  until there are ~30 days.")
+    # Spread cost, computed over ONE trade set: only the trades that have a mid.
+    # Subtracting a mid-filled P&L over some trades from an ask-filled P&L over
+    # all of them is not a spread, it is the difference between two populations.
+    cmp = trades[trades["mid"].notna()]
+    if len(cmp):
+        cmp_mid_price = np.where(cmp["side"] == "YES", cmp["mid"], 1.0 - cmp["mid"])
+        cmp_ask = float((stake * (cmp["won"] - cmp["price"])).sum())
+        cmp_mid = float((stake * (cmp["won"] - cmp_mid_price)).sum())
+        print(f"\n  On the {len(cmp)} of {len(trades)} trades with a two-sided "
+              f"book:")
+        print(f"    filled at ask/bid (real)  : {cmp_ask:+.2f}")
+        print(f"    filled at mid (not real)  : {cmp_mid:+.2f}")
+        print(f"    spread cost               : {cmp_mid - cmp_ask:.2f}")
+    if len(cmp) < len(trades):
+        print(f"  {len(trades) - len(cmp)} trade(s) had a one-sided book and are "
+              f"excluded from that comparison")
+        print("  only -- they are included in the P&L above, where the quoted "
+              "side is all that is needed.")
+
+    print("\n  Fills assume the whole stake trades at the best quote. The book's "
+          "depth was")
+    print("  never recorded, so this is an upper bound at one share, not a P&L "
+          "achievable")
+    print("  at size.")
 
 
 def cmd_cutoffs(args) -> None:
