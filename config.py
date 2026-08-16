@@ -84,6 +84,23 @@ def add_station_arg(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help=f"target station (default {DEFAULT_STATION})")
     return ap
 
+# --- Same-day settlement guard -----------------------------------------------
+# The clock cutoff assumes one afternoon peak; when the realised max so far
+# already exceeds this quantile of our own predictive distribution, the day is
+# treated as settled whatever the hour and logging stops.
+#
+# Tunable rather than fixed, because it is a trade with two measured sides. Over
+# 636 KLGA forecast days, of the post-peak rows the clock lets through:
+#   p90 stops 11% for 0.1% of clean rows
+#   p75 stops 24% for 0.8%   <- shipped
+#   p60 stops 38% for 2.4%
+#   p50 stops 48% for 3.8%
+# Reproduce with `python3 src/clv.py cutoffs --override`.
+DETERMINED_QUANTILE = float(os.environ.get("WEATHERBOT_DETERMINED_QUANTILE", "0.75"))
+if not 0.5 < DETERMINED_QUANTILE < 1.0:
+    raise SystemExit(f"WEATHERBOT_DETERMINED_QUANTILE must be in (0.5, 1.0), "
+                     f"got {DETERMINED_QUANTILE}")
+
 # --- Backfill ranges ---------------------------------------------------------
 # Observations are cheap and carry no provenance problem, so they start earlier
 # than the forecast backbone to give climatology/persistence baselines a runway.

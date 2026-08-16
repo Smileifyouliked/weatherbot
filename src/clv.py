@@ -111,14 +111,8 @@ SEASON_OF_MONTH = {12: "DJF", 1: "DJF", 2: "DJF", 3: "MAM", 4: "MAM", 5: "MAM",
 
 # Winter is bimodal -- about 10% of DJF days peak just after midnight on a
 # frontal passage -- so the clock alone cannot say whether the day is settled.
-# If the realised max so far already exceeds this quantile of our own predictive
-# distribution, the day is treated as determined whatever the hour.
-#
-# Measured over 636 forecast days, this stops 11% of the post-peak rows the clock
-# lets through, at a cost of 0.1% of clean rows. It is a precise backstop, not
-# the main guard: the cutoff is what actually limits leakage. p75 would catch 24%
-# for 0.8% of clean rows if that trade is ever wanted.
-DETERMINED_QUANTILE = 0.90
+# The same-day guard lives in config.DETERMINED_QUANTILE, read at call time so a
+# tuned value takes effect without touching this module.
 
 # The polling schedule `cutoffs` scores the cutoffs against. Snapshots are taken
 # every POLL_INTERVAL_MIN minutes from the moment that day's 00Z ECMWF run can
@@ -188,16 +182,20 @@ def already_determined(target: date, mu: float, sigma: float) -> tuple[bool, str
     by 09:00 the answer is known while the clock says hours remain. If what has
     already been reported exceeds a high quantile of our own forecast, the
     remaining uncertainty is small enough to stop.
+
+    The quantile is read from config on every call, not captured at import, so
+    tuning it takes effect everywhere at once.
     """
-    from baselines import _Phi  # local import keeps the module import graph flat
-    z = 1.2815515655446004      # Phi^-1(0.90)
-    threshold = mu + z * sigma
+    from statistics import NormalDist
+
+    q = config.DETERMINED_QUANTILE
+    threshold = mu + NormalDist().inv_cdf(q) * sigma
     seen = realized_max_so_far(target)
     if seen is None:
         return False, ""
     if seen >= threshold:
         return True, (f"realised max {seen:.0f}F already at/above our "
-                      f"p{int(DETERMINED_QUANTILE * 100)} of {threshold:.1f}F")
+                      f"p{q * 100:.0f} of {threshold:.1f}F")
     return False, ""
 
 
@@ -831,7 +829,7 @@ def cmd_cutoffs(args) -> None:
 
     if not args.override:
         print("\n  (pass --override to measure what the same-day p"
-              f"{int(DETERMINED_QUANTILE * 100)} guard actually stops; it needs")
+              f"{config.DETERMINED_QUANTILE * 100:.0f} guard actually stops; it needs")
         print("   the walk-forward blend and takes a few minutes)")
         return
 
@@ -847,25 +845,27 @@ def cmd_cutoffs(args) -> None:
             f"{'clean lost':>13}")
     print(head)
     print("-" * len(head))
-    for q in (0.50, 0.60, 0.75, DETERMINED_QUANTILE):
-        res = simulate_override(hourly, peak, pred, seasonal, args.lag,
-                                args.interval, q)
-        f = res["frame"]
+    shipped = config.DETERMINED_QUANTILE
+    scan = {}
+    for q in sorted({0.50, 0.60, 0.75, 0.90, shipped}):
+        f = simulate_override(hourly, peak, pred, seasonal, args.lag,
+                              args.interval, q)["frame"]
         tot, post = int(f["total"].sum()), int(f["post"].sum())
         ps, cl = int(f["post_stopped"].sum()), int(f["clean_stopped"].sum())
-        clean = tot - post
-        print(f"p{int(q * 100):<9}{tot:>8,}{post:>7,}"
+        scan[q] = (tot, post, ps, cl)
+        mark = "  <- shipped" if q == shipped else ""
+        print(f"p{q * 100:<9.0f}{tot:>8,}{post:>7,}"
               f"{ps:>10,} ({ps / max(post, 1):>3.0%}){cl:>8,} "
-              f"({cl / max(clean, 1):>3.1%})")
-        if q == DETERMINED_QUANTILE:
-            print(f"\n  At the shipped p{int(q * 100)}: {post - ps:,} post-peak rows "
-                  f"({(post - ps) / tot:.1%} of all rows) still get through, and")
-            print(f"  {cl:,} clean rows are stopped early. The override is a narrow, "
-                  f"precise backstop --")
-            print("  the clock is doing the work. Lowering it to p75 would catch "
-                  "more at a real cost")
-            print("  in clean rows, which is a trade to make deliberately, not by "
-                  "default.")
+              f"({cl / max(tot - post, 1):>3.1%}){mark}")
+
+    tot, post, ps, cl = scan[shipped]
+    print(f"\n  At the shipped p{shipped * 100:.0f}: {post - ps:,} post-peak rows "
+          f"({(post - ps) / tot:.1%} of all rows) still get through, and "
+          f"{cl:,} clean")
+    print(f"  rows ({cl / max(tot - post, 1):.1%}) are stopped early. The clock is "
+          f"still the primary guard;")
+    print("  this is a backstop with a measured price. Tune with "
+          "WEATHERBOT_DETERMINED_QUANTILE.")
 
 
 def main() -> None:
@@ -884,7 +884,8 @@ def main() -> None:
                             help="single target day instead of the default window")
         if name == "cutoffs":
             sp.add_argument("--override", action="store_true",
-                            help="also simulate the same-day p90 guard (slow)")
+                            help="also simulate the same-day settlement guard "
+                                 "across quantiles (slow)")
             sp.add_argument("--lag", type=float, default=WINDOW_OPEN_HOURS_AFTER_00Z,
                             help="hours after 00Z the run becomes retrievable "
                                  f"(default {WINDOW_OPEN_HOURS_AFTER_00Z}, measured)")
