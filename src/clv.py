@@ -30,12 +30,13 @@ prices measures nothing and contaminates the CLV comparison with
 trivially-known outcomes. Rows captured before the guard existed are kept as a
 record but flagged `excluded`, never deleted.
 
-The binding constraint at the other end is publication lag. The ECMWF Single
-Runs archive had not published a 00Z run 3.2 hours after it was issued, while
-the previous 12Z run was available 13.2 hours after issue -- so the forecast for
-today lands somewhere in 03:12Z-13:12Z. NBM's 00Z bulletin is quicker, present
-by about 03:00Z. The useful polling window for a target local day therefore runs
-from whenever the 00Z run appears until 17:00Z (EDT) or 18:00Z (EST).
+The binding constraint at the other end is publication lag. It is being measured
+directly (tools/measure_run_lag.py); so far one 00Z run has been caught while
+pending, appearing 7.46 h after issue, i.e. 07:27Z. The other two rows are upper
+bounds only -- the run was already there when watching began. NBM's 00Z bulletin
+is quicker, present by about 03:00Z. So the useful polling window for a target
+local day runs from roughly 07:30Z to 20:00Z, the seasonal cutoff in UTC. The
+cron window is deliberately not fixed on a single sample.
 
 MARKET STRUCTURE
 ----------------
@@ -69,8 +70,7 @@ from mos import (  # noqa: E402
     FEATURES_MEAN, LEAD, build_features, load_nbm, select_features, walk_forward,
 )
 from blend import (  # noqa: E402
-    DEFAULT_INFLATE, DEFAULT_MODE, NBM_FEATURES, NBM_SIGMA,
-    blend_walk_forward,
+    DEFAULT_MODE, NBM_FEATURES, NBM_SIGMA, blend_walk_forward, default_inflate,
 )
 
 GAMMA = "https://gamma-api.polymarket.com"
@@ -93,11 +93,42 @@ HOLDOUT_FRAC = 0.25
 DISTANCE_BINS = [0.0, 0.5, 1.0, 2.0, np.inf]
 DISTANCE_LABELS = ["<0.5s (centre)", "0.5-1s", "1-2s", ">2s (tail)"]
 
-# Local hour by which the daily maximum has usually happened. A snapshot taken
-# after this is scoring a near-known outcome: the market has seen the morning
-# and prices it at ~0 or ~1, which flatters it and tells us nothing about
-# forecast skill. Such rows are logged but excluded from scoring by default.
-PEAK_LOCAL_HOUR = 13
+# Local hour by which the daily maximum has usually happened, per season. Past
+# it a snapshot is scoring a near-known outcome, which flatters the market and
+# tells us nothing about forecast skill; such rows are logged but excluded from
+# scoring by default.
+#
+# A single 13:00 cutoff was too early. Scored the way the logger actually runs --
+# a snapshot every 30 minutes from the moment the forecast lands, over 2,783
+# complete KLGA days -- moving to these seasonal cutoffs yields 57,710 clean rows
+# against 50,224, +14.9%, while leakage (rows timestamped after that day's
+# realised max) goes 12.8% -> 20.1%. Leaked rows are flagged `excluded` and never
+# scored, so the trade is more usable data against more dead storage.
+# Run `python3 src/clv.py cutoffs` to reproduce it from this station's history.
+PEAK_LOCAL_HOUR_BY_SEASON = {"DJF": 15.0, "MAM": 16.0, "JJA": 16.0, "SON": 15.5}
+SEASON_OF_MONTH = {12: "DJF", 1: "DJF", 2: "DJF", 3: "MAM", 4: "MAM", 5: "MAM",
+                   6: "JJA", 7: "JJA", 8: "JJA", 9: "SON", 10: "SON", 11: "SON"}
+
+# Winter is bimodal -- about 10% of DJF days peak just after midnight on a
+# frontal passage -- so the clock alone cannot say whether the day is settled.
+# The same-day guard lives in config.DETERMINED_QUANTILE, read at call time so a
+# tuned value takes effect without touching this module.
+
+# The polling schedule `cutoffs` scores the cutoffs against. Snapshots are taken
+# every POLL_INTERVAL_MIN minutes from the moment that day's 00Z ECMWF run can
+# be retrieved until the seasonal cutoff, so what a cutoff actually costs is
+# measured in rows, not in days.
+#
+# The open time is the measured publication lag of the 00Z run (see
+# tools/measure_run_lag.py). It rests on one clean measurement so far -- the
+# 2026-08-15 00Z run appeared 7.46 h after issue -- so it is an assumption the
+# command prints and a flag the caller can move, not a schedule to cron against.
+POLL_INTERVAL_MIN = 30
+WINDOW_OPEN_HOURS_AFTER_00Z = 7.46
+
+
+def peak_hour_for(target: date) -> float:
+    return PEAK_LOCAL_HOUR_BY_SEASON[SEASON_OF_MONTH[target.month]]
 
 
 def c_to_f(c):
@@ -111,8 +142,61 @@ def hours_before_peak(stamp: pd.Timestamp, target: date) -> float:
     carrying information about an uncertain outcome.
     """
     local = stamp.tz_convert(config.STATION_TZ)
-    peak = pd.Timestamp(target, tz=config.STATION_TZ) + pd.Timedelta(hours=PEAK_LOCAL_HOUR)
+    peak = (pd.Timestamp(target, tz=config.STATION_TZ)
+            + pd.Timedelta(hours=peak_hour_for(target)))
     return float((peak - local).total_seconds() / 3600.0)
+
+
+def realized_max_so_far(target: date) -> float | None:
+    """Highest temperature reported at the station so far on `target`, in F.
+
+    Returns None when nothing has been reported yet, or the fetch fails -- an
+    absent reading must never be read as "cool so far".
+    """
+    config.use_station(MARKET_STATION_ICAO)
+    try:
+        r = requests.get(config.IEM_ASOS_URL, params={
+            "station": config.STATION_IEM_ID, "data": "tmpf",
+            "year1": target.year, "month1": target.month, "day1": target.day,
+            "year2": target.year, "month2": target.month, "day2": target.day,
+            "tz": config.STATION_TZ, "format": "onlycomma", "latlon": "no",
+            "missing": "empty", "trace": "empty", "report_type": 3,
+        }, timeout=config.HTTP_TIMEOUT)
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    import io
+    df = pd.read_csv(io.StringIO(r.text))
+    if df.empty or "tmpf" not in df.columns:
+        return None
+    v = pd.to_numeric(df["tmpf"], errors="coerce").dropna()
+    return float(v.max()) if len(v) else None
+
+
+def already_determined(target: date, mu: float, sigma: float) -> tuple[bool, str]:
+    """Whether today's max is already settled regardless of the clock.
+
+    The seasonal cutoff assumes a single afternoon peak. Winter breaks that:
+    roughly 10% of DJF days peak just after midnight on a frontal passage, and
+    by 09:00 the answer is known while the clock says hours remain. If what has
+    already been reported exceeds a high quantile of our own forecast, the
+    remaining uncertainty is small enough to stop.
+
+    The quantile is read from config on every call, not captured at import, so
+    tuning it takes effect everywhere at once.
+    """
+    from statistics import NormalDist
+
+    q = config.DETERMINED_QUANTILE
+    threshold = mu + NormalDist().inv_cdf(q) * sigma
+    seen = realized_max_so_far(target)
+    if seen is None:
+        return False, ""
+    if seen >= threshold:
+        return True, (f"realised max {seen:.0f}F already at/above our "
+                      f"p{q * 100:.0f} of {threshold:.1f}F")
+    return False, ""
 
 
 def apply_exclusions(log: pd.DataFrame) -> pd.DataFrame:
@@ -132,7 +216,7 @@ def apply_exclusions(log: pd.DataFrame) -> pd.DataFrame:
         late = log["hours_before_peak"].fillna(-1.0) <= 0
         newly = late & ~log["excluded"]
         log.loc[newly, "excluded"] = True
-        log.loc[newly, "exclude_reason"] = f"logged after {PEAK_LOCAL_HOUR}:00 local"
+        log.loc[newly, "exclude_reason"] = "logged after the season's peak hour"
     return log
 
 
@@ -285,7 +369,7 @@ def predict_market(target: date) -> tuple[float, float, int]:
             f"that day may not be cached yet (run ingest_forecast.py)")
 
     out = blend_walk_forward(comp, pd.DatetimeIndex([D]), DEFAULT_MODE,
-                             inflate=DEFAULT_INFLATE)
+                             inflate=default_inflate())
     if out.empty:
         raise wxio.SourceError(f"not enough training history before {target}")
     row = out.iloc[0]
@@ -355,13 +439,19 @@ def cmd_log(args) -> None:
         # prices sit at ~0 or ~1; logging that records no information and
         # contaminates the CLV comparison with trivially-known outcomes.
         hours_left = hours_before_peak(stamp, t)
+        cutoff = peak_hour_for(t)
         if hours_left <= 0:
-            print(f"  {t}: past {PEAK_LOCAL_HOUR}:00 local "
-                  f"({-hours_left:.1f}h ago) -- max already determined, not logged")
+            print(f"  {t}: past {cutoff:.1f} local "
+                  f"({-hours_left:.1f}h ago) -- max likely determined, not logged")
             continue
 
         mu = float(pred.loc[ts, "mu_f"])
         sigma = float(pred.loc[ts, "sigma_f"])
+
+        determined, why = already_determined(t, mu, sigma)
+        if determined:
+            print(f"  {t}: {why} -- day already settled, not logged")
+            continue
         mkts, failures = market_rows(event, t)
         for why in failures:
             print(f"  {t}: skipped a market -- {why}")
@@ -549,11 +639,241 @@ def cmd_score(args) -> None:
               f"{len(df)}.")
 
 
+def hourly_history(start_year: int = 2019) -> pd.DataFrame:
+    """Every reported temperature at the market station, in station-local time.
+
+    Local rather than UTC by deliberate exception to hard rule 6: a daily
+    maximum is defined on the local day, so this frame *is* the resolution
+    boundary. Everything derived from it is put back on UTC timestamps.
+    """
+    import io
+    config.use_station(MARKET_STATION_ICAO)
+    today = date.today()
+    r = requests.get(config.IEM_ASOS_URL, params={
+        "station": config.STATION_IEM_ID, "data": "tmpf",
+        "year1": start_year, "month1": 1, "day1": 1,
+        "year2": today.year, "month2": today.month, "day2": today.day,
+        "tz": config.STATION_TZ, "format": "onlycomma", "latlon": "no",
+        "missing": "empty", "trace": "empty", "report_type": 3,
+    }, timeout=300)
+    if r.status_code != 200:
+        raise wxio.SourceError(f"IEM hourly: HTTP {r.status_code}")
+
+    d = pd.read_csv(io.StringIO(r.text))
+    d["valid"] = pd.to_datetime(d["valid"])
+    d["tmpf"] = pd.to_numeric(d["tmpf"], errors="coerce")
+    d = d.dropna(subset=["tmpf"]).sort_values("valid")
+    d["day"] = pd.to_datetime(d["valid"].dt.date)
+    d["hour"] = d["valid"].dt.hour + d["valid"].dt.minute / 60.0
+    return d
+
+
+def peak_times(hourly: pd.DataFrame) -> pd.DataFrame:
+    """One row per complete local day: when that day's maximum was reported."""
+    counts = hourly.groupby("day")["tmpf"].size()
+    peak = hourly.loc[hourly.groupby("day")["tmpf"].idxmax(),
+                      ["day", "hour", "tmpf"]].copy()
+    peak["n"] = counts.reindex(peak["day"]).values
+    peak = peak[peak["n"] >= config.MIN_HOURS_PER_DAY].reset_index(drop=True)
+    peak["season"] = peak["day"].dt.month.map(SEASON_OF_MONTH)
+    return peak
+
+
+def schedule_bounds(days: pd.Series, cut_hours: np.ndarray,
+                    lag_h: float) -> tuple[pd.Series, pd.Series]:
+    """UTC open and close of the polling window for each local day.
+
+    Opens when that day's 00Z run becomes retrievable, closes at the seasonal
+    cutoff in station-local time -- which is a different UTC hour in summer and
+    winter, so the conversion cannot be folded into a constant.
+    """
+    local_midnight = days.dt.tz_localize(config.STATION_TZ)
+    open_utc = days.dt.tz_localize("UTC") + pd.Timedelta(hours=lag_h)
+    close_utc = (local_midnight + pd.to_timedelta(cut_hours, unit="h")).dt.tz_convert("UTC")
+    return open_utc, close_utc
+
+
+def simulate_schedule(peak: pd.DataFrame, cut_hours: np.ndarray,
+                      lag_h: float, interval_min: int) -> pd.DataFrame:
+    """Count the rows a polling schedule would produce, clean and post-peak.
+
+    A row is post-peak if it is timestamped after that day's realised maximum.
+    This is the metric that matters, because prices are snapshotted throughout
+    the window rather than once at the cutoff: a day that peaks two hours before
+    its cutoff still yields a full morning of clean rows and only leaks the last
+    few.
+    """
+    step = pd.Timedelta(minutes=interval_min)
+    open_utc, close_utc = schedule_bounds(peak["day"], cut_hours, lag_h)
+    peak_utc = ((peak["day"].dt.tz_localize(config.STATION_TZ)
+                 + pd.to_timedelta(peak["hour"], unit="h")).dt.tz_convert("UTC"))
+
+    # Floor division on Timedeltas rather than on int64 nanoseconds: pandas
+    # stores these columns in microseconds, so a hand-rolled ns conversion is
+    # silently wrong by 1000x.
+    total = np.maximum(((close_utc - open_utc) // step).to_numpy() + 1, 0)
+    clean = np.clip(((peak_utc - open_utc) // step).to_numpy() + 1, 0, total)
+    return pd.DataFrame({"season": peak["season"].to_numpy(),
+                         "day": peak["day"].to_numpy(),
+                         "total": total, "clean": clean, "post": total - clean})
+
+
+def print_schedule(title: str, sim: pd.DataFrame) -> None:
+    print(f"\n{title}")
+    head = (f"{'season':<8}{'days':>7}{'clean':>9}{'post':>8}{'total':>9}"
+            f"{'leak%':>8}{'clean/day':>11}")
+    print(head)
+    print("-" * len(head))
+    for s_ in ("DJF", "MAM", "JJA", "SON", "ALL"):
+        g = sim if s_ == "ALL" else sim[sim["season"] == s_]
+        c, p, t = int(g["clean"].sum()), int(g["post"].sum()), int(g["total"].sum())
+        print(f"{s_:<8}{len(g):>7}{c:>9,}{p:>8,}{t:>9,}"
+              f"{(p / t if t else 0):>8.1%}{(c / max(len(g), 1)):>11.2f}")
+
+
+def simulate_override(hourly: pd.DataFrame, peak: pd.DataFrame,
+                      pred: pd.DataFrame, cut_hours: np.ndarray, lag_h: float,
+                      interval_min: int, quantile: float) -> dict:
+    """What the same-day override would have stopped, row by row.
+
+    The override fires at the first snapshot whose realised max so far already
+    exceeds the given quantile of our own predictive distribution; from then on
+    the day is treated as settled and nothing further is logged. Reported as
+    post-peak rows prevented (the point of it) against clean rows lost (the
+    price of it).
+    """
+    from statistics import NormalDist
+
+    z = NormalDist().inv_cdf(quantile)
+    step = pd.Timedelta(minutes=interval_min)
+    thr = (pred["mu"] + z * pred["sigma"]).to_dict()
+
+    open_utc, close_utc = schedule_bounds(peak["day"], cut_hours, lag_h)
+    peak_utc = ((peak["day"].dt.tz_localize(config.STATION_TZ)
+                 + pd.to_timedelta(peak["hour"], unit="h")).dt.tz_convert("UTC"))
+    by_day = {d: g for d, g in hourly.groupby("day")}
+
+    rows = []
+    for i, day in enumerate(peak["day"]):
+        if day not in thr or day not in by_day:
+            continue
+        n = int(max((close_utc.iloc[i] - open_utc.iloc[i]) // step + 1, 0))
+        if n == 0:
+            continue
+        stamps = (open_utc.iloc[i]
+                  + pd.to_timedelta(np.arange(n) * interval_min, unit="m"))
+        is_post = np.asarray(stamps > peak_utc.iloc[i])
+
+        # Running max at each snapshot: the day's readings are already sorted,
+        # so a cumulative max plus a searchsorted gives "what was known by then".
+        # Compared tz-naive in UTC, because searchsorted on a tz-aware column
+        # falls back to an object array of Timestamps.
+        g = by_day[day]
+        obs_utc = (g["valid"].dt.tz_localize(config.STATION_TZ, ambiguous="NaT",
+                                             nonexistent="NaT").dt.tz_convert("UTC"))
+        keep = obs_utc.notna()
+        obs_utc, vals = obs_utc[keep], g.loc[keep, "tmpf"]
+        if obs_utc.empty:
+            continue
+        seen = np.searchsorted(obs_utc.dt.tz_localize(None).to_numpy(),
+                               stamps.tz_localize(None).to_numpy(), side="right")
+        runmax = np.concatenate([[-np.inf], np.maximum.accumulate(vals.to_numpy())])[seen]
+
+        fired = np.flatnonzero(runmax >= thr[day])
+        k = int(fired[0]) if len(fired) else n     # index of the first stopped row
+        rows.append({
+            "season": peak["season"].iloc[i], "total": n,
+            "post": int(is_post.sum()),
+            "post_stopped": int(is_post[k:].sum()),
+            "clean_stopped": int((~is_post[k:]).sum()),
+        })
+    return {"frame": pd.DataFrame(rows), "z": z}
+
+
+def cmd_cutoffs(args) -> None:
+    """Score the cutoffs the way the logger actually runs: per row, not per day.
+
+    An earlier version reported the share of *days* whose maximum preceded the
+    cutoff. That overstated the cost badly, because prices are snapshotted every
+    30 minutes from the moment the forecast lands: a day peaking at 14:00 under
+    a 16:00 cutoff is not a lost day, it is ~17 clean rows and 4 leaked ones. So
+    leakage here is the share of logged rows timestamped after that day's
+    realised maximum, and it is read against the absolute count of clean rows --
+    a schedule that leaks more but yields far more clean rows is the better one.
+    """
+    hourly = hourly_history()
+    peak = peak_times(hourly)
+    print(f"station: {config.STATION_ICAO}   hourly history from IEM")
+    print(f"{len(peak):,} complete days, {peak['day'].min():%Y-%m-%d} -> "
+          f"{peak['day'].max():%Y-%m-%d}")
+    print(f"schedule: every {args.interval} min, from 00Z+{args.lag:.2f}h "
+          f"(measured ECMWF publication lag) to the cutoff, station-local")
+
+    seasonal = peak["season"].map(PEAK_LOCAL_HOUR_BY_SEASON).to_numpy(float)
+    flat = np.full(len(peak), args.flat)
+
+    sim_flat = simulate_schedule(peak, flat, args.lag, args.interval)
+    sim_seas = simulate_schedule(peak, seasonal, args.lag, args.interval)
+    print_schedule(f"flat {args.flat:.0f}:00 cutoff -- row-weighted", sim_flat)
+    print_schedule("season-aware cutoffs "
+                   + ", ".join(f"{k} {v:.1f}" for k, v in
+                               PEAK_LOCAL_HOUR_BY_SEASON.items())
+                   + " -- row-weighted", sim_seas)
+
+    cf, cs = int(sim_flat["clean"].sum()), int(sim_seas["clean"].sum())
+    print(f"\n  season-aware buys {cs - cf:+,} clean rows ({(cs / cf - 1):+.1%}) "
+          f"for leakage {sim_flat['post'].sum() / sim_flat['total'].sum():.1%} -> "
+          f"{sim_seas['post'].sum() / sim_seas['total'].sum():.1%}.")
+    print("  Post-peak rows are logged but flagged `excluded`, so they cost "
+          "storage, not scoring.")
+
+    if not args.override:
+        print("\n  (pass --override to measure what the same-day p"
+              f"{config.DETERMINED_QUANTILE * 100:.0f} guard actually stops; it needs")
+        print("   the walk-forward blend and takes a few minutes)")
+        return
+
+    # --- what the same-day override adds on top of the clock ------------------
+    comp = components(MARKET_STATION_ICAO)
+    bl = blend_walk_forward(comp, comp.index, DEFAULT_MODE, inflate=default_inflate())
+    pred = pd.DataFrame({"mu": bl["mu"], "sigma": bl["sigma"]})
+    print(f"\nSame-day override, on the {len(pred)} days with a walk-forward "
+          f"forecast ({pred.index.min():%Y-%m-%d} -> {pred.index.max():%Y-%m-%d})")
+    print("  season-aware schedule; a fired override stops all later rows that day")
+
+    head = (f"{'quantile':<10}{'rows':>8}{'post':>7}{'post stopped':>15}"
+            f"{'clean lost':>13}")
+    print(head)
+    print("-" * len(head))
+    shipped = config.DETERMINED_QUANTILE
+    scan = {}
+    for q in sorted({0.50, 0.60, 0.75, 0.90, shipped}):
+        f = simulate_override(hourly, peak, pred, seasonal, args.lag,
+                              args.interval, q)["frame"]
+        tot, post = int(f["total"].sum()), int(f["post"].sum())
+        ps, cl = int(f["post_stopped"].sum()), int(f["clean_stopped"].sum())
+        scan[q] = (tot, post, ps, cl)
+        mark = "  <- shipped" if q == shipped else ""
+        print(f"p{q * 100:<9.0f}{tot:>8,}{post:>7,}"
+              f"{ps:>10,} ({ps / max(post, 1):>3.0%}){cl:>8,} "
+              f"({cl / max(tot - post, 1):>3.1%}){mark}")
+
+    tot, post, ps, cl = scan[shipped]
+    print(f"\n  At the shipped p{shipped * 100:.0f}: {post - ps:,} post-peak rows "
+          f"({(post - ps) / tot:.1%} of all rows) still get through, and "
+          f"{cl:,} clean")
+    print(f"  rows ({cl / max(tot - post, 1):.1%}) are stopped early. The clock is "
+          f"still the primary guard;")
+    print("  this is a backstop with a measured price. Tune with "
+          "WEATHERBOT_DETERMINED_QUANTILE.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, fn in (("predict", cmd_predict), ("log", cmd_log),
-                     ("resolve", cmd_resolve), ("score", cmd_score)):
+                     ("resolve", cmd_resolve), ("score", cmd_score),
+                     ("cutoffs", cmd_cutoffs)):
         sp = sub.add_parser(name)
         sp.set_defaults(fn=fn)
         if name == "score":
@@ -562,6 +882,17 @@ def main() -> None:
         if name == "predict":
             sp.add_argument("--date", type=date.fromisoformat, default=None,
                             help="single target day instead of the default window")
+        if name == "cutoffs":
+            sp.add_argument("--override", action="store_true",
+                            help="also simulate the same-day settlement guard "
+                                 "across quantiles (slow)")
+            sp.add_argument("--lag", type=float, default=WINDOW_OPEN_HOURS_AFTER_00Z,
+                            help="hours after 00Z the run becomes retrievable "
+                                 f"(default {WINDOW_OPEN_HOURS_AFTER_00Z}, measured)")
+            sp.add_argument("--interval", type=int, default=POLL_INTERVAL_MIN,
+                            help=f"minutes between snapshots (default {POLL_INTERVAL_MIN})")
+            sp.add_argument("--flat", type=float, default=13.0,
+                            help="comparison flat cutoff, local hour (default 13)")
     args = ap.parse_args()
     args.fn(args)
 

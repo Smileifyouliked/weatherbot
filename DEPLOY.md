@@ -231,6 +231,8 @@ edit outside the repository.
 |---|---|---|
 | `WEATHERBOT_DATA_DIR` | `<repo>/data` | Where the parquet caches and CLV log live |
 | `WEATHERBOT_LOG_DIR` | `<repo>/logs` | Where the timestamped run log is written |
+| `WEATHERBOT_STATION` | `KNYC` | Default station for modules run without `--station` (the CLV job always uses KLGA regardless) |
+| `WEATHERBOT_DETERMINED_QUANTILE` | `0.75` | Same-day settlement guard: stop logging once the realised max exceeds this quantile of our forecast. Must be in (0.5, 1.0); see `src/clv.py cutoffs --override` for the trade |
 | `HTTPS_PROXY` | unset | Standard `requests` proxy support, if egress is proxied |
 
 ## 9. Checking it works
