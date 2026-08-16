@@ -23,13 +23,21 @@ class Station:
     tz: str
     iem_network: str
     note: str = ""
+    # Whether the blend's spread scalar is applied by default. It is always
+    # fitted on this station's own data; this only says whether applying it
+    # improves calibration here, which is a measured property of the station.
+    inflate: bool = True
 
 
 STATIONS: dict[str, Station] = {
     "KNYC": Station("KNYC", "NYC", 40.7790, -73.9693, "America/New_York",
                     "NY_ASOS", "Central Park; the original target"),
+    # KLGA: the scalar overshoots here. Uninflated PIT is 0.95; inflating moves
+    # it to 1.06, further from 1.00, for +0.005 CRPS. KNYC goes 0.93 -> 1.02 and
+    # keeps it. Same code, opposite verdict, so the choice belongs to the station.
     "KLGA": Station("KLGA", "LGA", 40.7794, -73.8803, "America/New_York",
-                    "NY_ASOS", "LaGuardia; what the Polymarket NYC market settles on"),
+                    "NY_ASOS", "LaGuardia; what the Polymarket NYC market settles on",
+                    inflate=False),
 }
 
 # Which station the modules act on when nothing says otherwise. Every entry

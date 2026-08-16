@@ -74,11 +74,13 @@ NOISE_FLOOR_CRPS = 0.05      # below this, a seasonal gain is not a gain
 # size fitted weights do not pay for themselves (see CLAUDE.md rule 5a).
 DEFAULT_MODE = "invvar"
 
-# The default blend also carries the spread scalar. Without it the blend is
-# underconfident (PIT variance ratio 0.93); with it PIT is 1.02 for +0.003 CRPS.
-# This project exists to emit calibrated distributions, so that trade is worth
-# making (CLAUDE.md rule 5b).
-DEFAULT_INFLATE = True
+# Whether the default blend carries the spread scalar is a property of the
+# station, not of the code: it is measured, and the two stations disagree.
+# KNYC uninflated sits at PIT 0.93 and inflating moves it to 1.02, worth +0.003
+# CRPS. KLGA uninflated sits at 0.95 and inflating overshoots to 1.06, further
+# from 1.00. See config.Station.inflate and CLAUDE.md rule 5b.
+def default_inflate() -> bool:
+    return config.STATIONS[config.STATION_ICAO].inflate
 
 # Held-out tail of the training window used to fit the spread scalar.
 HOLDOUT_FRAC = 0.25
@@ -276,17 +278,18 @@ def main() -> None:
     comp["sin_doy"] = np.sin(2 * np.pi * doy / 365.25)
     comp["cos_doy"] = np.cos(2 * np.pi * doy / 365.25)
 
-    # The default carries the spread scalar; the uninflated variant is kept
-    # alongside it so the calibration cost of that one parameter stays visible.
-    bl_ivc = blend_walk_forward(comp, targets, DEFAULT_MODE, inflate=DEFAULT_INFLATE)
+    # Both variants are always computed, whichever the station ships, so the
+    # diagnostic below compares a real pair rather than a row against itself.
+    bl_ivc = blend_walk_forward(comp, targets, DEFAULT_MODE, inflate=True)
     bl_iv = blend_walk_forward(comp, targets, DEFAULT_MODE, inflate=False)
+    bl_default = bl_ivc if default_inflate() else bl_iv
     bl_fx = blend_walk_forward(comp, targets, "fixed")
     bl_se = blend_walk_forward(comp, targets, "seasonal")
     base = build_baselines(obs, fc_daily, targets)
 
     common = base.dropna(subset=["obs", "raw_mu", "raw_sigma", "clim_mu",
                                  "clim_sigma", "pers_mu", "pers_sigma"]).index
-    for frame in (mos, nbm_pp, bl_iv, bl_ivc, bl_fx, bl_se):
+    for frame in (mos, nbm_pp, bl_iv, bl_ivc, bl_default, bl_fx, bl_se):
         common = common.intersection(frame.index)
     nbm_raw = nbm.loc[nbm.index.intersection(common)]
     common = common.intersection(nbm_raw.index)
@@ -298,8 +301,10 @@ def main() -> None:
                                   "mu": nbm.loc[common, "nbm_tmax"],
                                   "sigma": nbm.loc[common, "xnd"].clip(lower=0.5)})),
         ("NBM post-processed", nbm_pp.loc[common]),
-        ("blend (default)", bl_ivc.loc[common]),
-        ("blend, no inflation", bl_iv.loc[common]),
+        (f"blend (default, inflation {'on' if default_inflate() else 'off'})",
+         bl_default.loc[common]),
+        ("  variant: + inflation", bl_ivc.loc[common]),
+        ("  variant: no inflation", bl_iv.loc[common]),
         ("blend fixed", bl_fx.loc[common]),
         ("blend seasonal", bl_se.loc[common]),
         ("raw deterministic", as_frame(base_c, "raw")),
@@ -370,12 +375,16 @@ def main() -> None:
     # --- spread inflation ---
     before, after = score(bl_iv.loc[common]), score(bl_ivc.loc[common])
     cost = after["CRPS"] - before["CRPS"]
-    print(f"\nSpread inflation (one scalar, ON by default)")
+    state = "ON" if default_inflate() else "OFF"
+    print(f"\nSpread inflation (one scalar, {state} by default for "
+          f"{config.STATION_ICAO})")
     print(f"  before   CRPS {before['CRPS']:.3f}   PIT {before['PIT']:.3f}")
     print(f"  after    CRPS {after['CRPS']:.3f}   PIT {after['PIT']:.3f}")
     print(f"  cost     {cost:+.3f} F CRPS  (limit {INFLATION_COST_LIMIT:.2f})")
     print(f"  mean c   {bl_ivc.loc[common, 'c'].mean():.3f}   "
           f"(<1 sharpens, >1 widens)")
+    print(f"  shipped  {'with' if default_inflate() else 'without'} the scalar "
+          f"for {config.STATION_ICAO} (config.Station.inflate)")
     if abs(after["PIT"] - 1.0) < abs(before["PIT"] - 1.0) and cost <= INFLATION_COST_LIMIT:
         print(f"  VERDICT: on. Calibration improves and the CRPS cost is inside "
               f"the limit.")

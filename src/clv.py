@@ -69,8 +69,7 @@ from mos import (  # noqa: E402
     FEATURES_MEAN, LEAD, build_features, load_nbm, select_features, walk_forward,
 )
 from blend import (  # noqa: E402
-    DEFAULT_INFLATE, DEFAULT_MODE, NBM_FEATURES, NBM_SIGMA,
-    blend_walk_forward,
+    DEFAULT_MODE, NBM_FEATURES, NBM_SIGMA, blend_walk_forward, default_inflate,
 )
 
 GAMMA = "https://gamma-api.polymarket.com"
@@ -93,11 +92,29 @@ HOLDOUT_FRAC = 0.25
 DISTANCE_BINS = [0.0, 0.5, 1.0, 2.0, np.inf]
 DISTANCE_LABELS = ["<0.5s (centre)", "0.5-1s", "1-2s", ">2s (tail)"]
 
-# Local hour by which the daily maximum has usually happened. A snapshot taken
-# after this is scoring a near-known outcome: the market has seen the morning
-# and prices it at ~0 or ~1, which flatters it and tells us nothing about
-# forecast skill. Such rows are logged but excluded from scoring by default.
-PEAK_LOCAL_HOUR = 13
+# Local hour by which the daily maximum has usually happened, per season. Past
+# it a snapshot is scoring a near-known outcome, which flatters the market and
+# tells us nothing about forecast skill; such rows are logged but excluded from
+# scoring by default.
+#
+# A single 13:00 cutoff was far too early: measured over 2782 complete KLGA days,
+# 73.5% of maxima occur after 13:00, so it discarded most of the genuinely
+# uncertain window. These are set nearer the seasonal medians. Run
+# `python3 src/clv.py cutoffs` to print the leakage each one implies from this
+# station's own history.
+PEAK_LOCAL_HOUR_BY_SEASON = {"DJF": 15.0, "MAM": 16.0, "JJA": 16.0, "SON": 15.5}
+SEASON_OF_MONTH = {12: "DJF", 1: "DJF", 2: "DJF", 3: "MAM", 4: "MAM", 5: "MAM",
+                   6: "JJA", 7: "JJA", 8: "JJA", 9: "SON", 10: "SON", 11: "SON"}
+
+# Winter is bimodal -- about 10% of DJF days peak just after midnight on a
+# frontal passage -- so the clock alone cannot say whether the day is settled.
+# If the realised max so far already exceeds this quantile of our own predictive
+# distribution, the day is treated as determined whatever the hour.
+DETERMINED_QUANTILE = 0.90
+
+
+def peak_hour_for(target: date) -> float:
+    return PEAK_LOCAL_HOUR_BY_SEASON[SEASON_OF_MONTH[target.month]]
 
 
 def c_to_f(c):
@@ -111,8 +128,57 @@ def hours_before_peak(stamp: pd.Timestamp, target: date) -> float:
     carrying information about an uncertain outcome.
     """
     local = stamp.tz_convert(config.STATION_TZ)
-    peak = pd.Timestamp(target, tz=config.STATION_TZ) + pd.Timedelta(hours=PEAK_LOCAL_HOUR)
+    peak = (pd.Timestamp(target, tz=config.STATION_TZ)
+            + pd.Timedelta(hours=peak_hour_for(target)))
     return float((peak - local).total_seconds() / 3600.0)
+
+
+def realized_max_so_far(target: date) -> float | None:
+    """Highest temperature reported at the station so far on `target`, in F.
+
+    Returns None when nothing has been reported yet, or the fetch fails -- an
+    absent reading must never be read as "cool so far".
+    """
+    config.use_station(MARKET_STATION_ICAO)
+    try:
+        r = requests.get(config.IEM_ASOS_URL, params={
+            "station": config.STATION_IEM_ID, "data": "tmpf",
+            "year1": target.year, "month1": target.month, "day1": target.day,
+            "year2": target.year, "month2": target.month, "day2": target.day,
+            "tz": config.STATION_TZ, "format": "onlycomma", "latlon": "no",
+            "missing": "empty", "trace": "empty", "report_type": 3,
+        }, timeout=config.HTTP_TIMEOUT)
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    import io
+    df = pd.read_csv(io.StringIO(r.text))
+    if df.empty or "tmpf" not in df.columns:
+        return None
+    v = pd.to_numeric(df["tmpf"], errors="coerce").dropna()
+    return float(v.max()) if len(v) else None
+
+
+def already_determined(target: date, mu: float, sigma: float) -> tuple[bool, str]:
+    """Whether today's max is already settled regardless of the clock.
+
+    The seasonal cutoff assumes a single afternoon peak. Winter breaks that:
+    roughly 10% of DJF days peak just after midnight on a frontal passage, and
+    by 09:00 the answer is known while the clock says hours remain. If what has
+    already been reported exceeds a high quantile of our own forecast, the
+    remaining uncertainty is small enough to stop.
+    """
+    from baselines import _Phi  # local import keeps the module import graph flat
+    z = 1.2815515655446004      # Phi^-1(0.90)
+    threshold = mu + z * sigma
+    seen = realized_max_so_far(target)
+    if seen is None:
+        return False, ""
+    if seen >= threshold:
+        return True, (f"realised max {seen:.0f}F already at/above our "
+                      f"p{int(DETERMINED_QUANTILE * 100)} of {threshold:.1f}F")
+    return False, ""
 
 
 def apply_exclusions(log: pd.DataFrame) -> pd.DataFrame:
@@ -132,7 +198,7 @@ def apply_exclusions(log: pd.DataFrame) -> pd.DataFrame:
         late = log["hours_before_peak"].fillna(-1.0) <= 0
         newly = late & ~log["excluded"]
         log.loc[newly, "excluded"] = True
-        log.loc[newly, "exclude_reason"] = f"logged after {PEAK_LOCAL_HOUR}:00 local"
+        log.loc[newly, "exclude_reason"] = "logged after the season's peak hour"
     return log
 
 
@@ -285,7 +351,7 @@ def predict_market(target: date) -> tuple[float, float, int]:
             f"that day may not be cached yet (run ingest_forecast.py)")
 
     out = blend_walk_forward(comp, pd.DatetimeIndex([D]), DEFAULT_MODE,
-                             inflate=DEFAULT_INFLATE)
+                             inflate=default_inflate())
     if out.empty:
         raise wxio.SourceError(f"not enough training history before {target}")
     row = out.iloc[0]
@@ -355,13 +421,19 @@ def cmd_log(args) -> None:
         # prices sit at ~0 or ~1; logging that records no information and
         # contaminates the CLV comparison with trivially-known outcomes.
         hours_left = hours_before_peak(stamp, t)
+        cutoff = peak_hour_for(t)
         if hours_left <= 0:
-            print(f"  {t}: past {PEAK_LOCAL_HOUR}:00 local "
-                  f"({-hours_left:.1f}h ago) -- max already determined, not logged")
+            print(f"  {t}: past {cutoff:.1f} local "
+                  f"({-hours_left:.1f}h ago) -- max likely determined, not logged")
             continue
 
         mu = float(pred.loc[ts, "mu_f"])
         sigma = float(pred.loc[ts, "sigma_f"])
+
+        determined, why = already_determined(t, mu, sigma)
+        if determined:
+            print(f"  {t}: {why} -- day already settled, not logged")
+            continue
         mkts, failures = market_rows(event, t)
         for why in failures:
             print(f"  {t}: skipped a market -- {why}")
@@ -549,11 +621,71 @@ def cmd_score(args) -> None:
               f"{len(df)}.")
 
 
+def cmd_cutoffs(args) -> None:
+    """Report what each seasonal cutoff costs, from the station's own history.
+
+    Leakage is the share of days whose maximum had already happened by the
+    cutoff: on those, snapshots taken right up to the cutoff are pricing a
+    settled outcome. Retained is the share still genuinely uncertain. Lowering a
+    cutoff cuts leakage but throws away uncertain market time, so this is the
+    trade the numbers have to be read against.
+    """
+    import io
+    config.use_station(MARKET_STATION_ICAO)
+    print(f"station: {config.STATION_ICAO}   hourly history from IEM")
+    r = requests.get(config.IEM_ASOS_URL, params={
+        "station": config.STATION_IEM_ID, "data": "tmpf",
+        "year1": 2019, "month1": 1, "day1": 1,
+        "year2": date.today().year, "month2": date.today().month,
+        "day2": date.today().day,
+        "tz": config.STATION_TZ, "format": "onlycomma", "latlon": "no",
+        "missing": "empty", "trace": "empty", "report_type": 3,
+    }, timeout=300)
+    if r.status_code != 200:
+        raise wxio.SourceError(f"IEM hourly: HTTP {r.status_code}")
+
+    d = pd.read_csv(io.StringIO(r.text))
+    d["valid"] = pd.to_datetime(d["valid"])
+    d["tmpf"] = pd.to_numeric(d["tmpf"], errors="coerce")
+    d = d.dropna(subset=["tmpf"])
+    d["day"] = d["valid"].dt.date
+    d["hour"] = d["valid"].dt.hour + d["valid"].dt.minute / 60.0
+
+    counts = d.groupby("day")["tmpf"].size()
+    peak = d.loc[d.groupby("day")["tmpf"].idxmax(), ["day", "hour"]].copy()
+    peak["n"] = counts.reindex(peak["day"]).values
+    peak = peak[peak["n"] >= config.MIN_HOURS_PER_DAY]
+    peak["day"] = pd.to_datetime(peak["day"])
+    peak["season"] = peak["day"].dt.month.map(SEASON_OF_MONTH)
+
+    print(f"{len(peak)} complete days, {peak['day'].min():%Y-%m-%d} -> "
+          f"{peak['day'].max():%Y-%m-%d}\n")
+    print(f"{'season':<8}{'cutoff':>8}{'n':>7}{'median pk':>11}"
+          f"{'leakage':>10}{'retained':>10}")
+    print("-" * 54)
+    for s_ in ("DJF", "MAM", "JJA", "SON"):
+        g = peak[peak["season"] == s_]
+        cut = PEAK_LOCAL_HOUR_BY_SEASON[s_]
+        leak = float((g["hour"] <= cut).mean())
+        print(f"{s_:<8}{cut:>8.1f}{len(g):>7}{g['hour'].median():>11.1f}"
+              f"{leak:>9.1%}{1 - leak:>10.1%}")
+    allleak = float(peak.apply(
+        lambda r: r["hour"] <= PEAK_LOCAL_HOUR_BY_SEASON[r["season"]], axis=1).mean())
+    print(f"{'ALL':<8}{'':>8}{len(peak):>7}{peak['hour'].median():>11.1f}"
+          f"{allleak:>9.1%}{1 - allleak:>10.1%}")
+    print(f"\n  For comparison, a flat 13:00 cutoff leaks "
+          f"{float((peak['hour'] <= 13).mean()):.1%}.")
+    print(f"  Residual leakage is handled per-day by the p"
+          f"{int(DETERMINED_QUANTILE * 100)} override, which stops logging once the")
+    print(f"  realised max already exceeds our own forecast quantile.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, fn in (("predict", cmd_predict), ("log", cmd_log),
-                     ("resolve", cmd_resolve), ("score", cmd_score)):
+                     ("resolve", cmd_resolve), ("score", cmd_score),
+                     ("cutoffs", cmd_cutoffs)):
         sp = sub.add_parser(name)
         sp.set_defaults(fn=fn)
         if name == "score":
