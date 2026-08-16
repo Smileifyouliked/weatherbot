@@ -7,22 +7,19 @@ Logging and scoring only. Nothing here places, sizes or recommends a trade.
     python3 src/clv.py resolve     # attach outcomes once the day is observed
     python3 src/clv.py score       # Brier, CLV, side-of-market, by distance from our mean
 
-STATION MISMATCH, and what this module does about it
-----------------------------------------------------
+WHICH STATION
+-------------
 Polymarket's "NYC" temperature market resolves on **KLGA (LaGuardia)** via
-Weather Underground, not KNYC (Central Park), which is what the rest of this
-project forecasts. Over 366 paired days KLGA minus KNYC is +0.55 F on average
-with a standard deviation of 1.78 F, and +1.92 F in summer. The blend's own
-sigma is about 2 F, so the station gap is as large as the entire predictive
-uncertainty: feeding KNYC probabilities into a KLGA-settled market would swamp
-any real edge and make the scoring meaningless.
+Weather Underground, not KNYC (Central Park). KLGA minus KNYC is +0.55 F on
+average with a standard deviation of 1.78 F, and +1.92 F in summer -- about as
+large as the predictive uncertainty itself, so the two are not interchangeable.
 
-So the cached prediction is a KLGA distribution, produced by regressing observed
-KLGA daily maxima on the KNYC blend mean plus day-of-year harmonics, fitted
-walk-forward exactly like every other model here (hard rules 1 and 2). This is a
-thin adaptation layer, not a KLGA pipeline: the underlying forecast fields are
-still interpolated to Central Park. A genuine KLGA build would re-pull ECMWF and
-NBM at LaGuardia and should beat it.
+This module therefore runs the **native KLGA** stack: its own ECMWF backbone
+interpolated to LaGuardia, its own NBM bulletin, its own observations, blended
+the same way as any other station. It does not touch the KNYC cache.
+
+Native replaced an earlier KNYC-blend-plus-adaptation route, which reached 1.42
+CRPS on the settled quantity against 1.33 for native over the same 364 days.
 
 WHEN A SNAPSHOT IS WORTH TAKING
 -------------------------------
@@ -69,16 +66,21 @@ import config  # noqa: E402
 import wxio  # noqa: E402
 from baselines import _Phi, load as load_daily  # noqa: E402
 from mos import (  # noqa: E402
-    FEATURES_MEAN, LEAD, _standardize, build_features, fit_log_sigma,
-    predict_sigma, ridge_fit, select_features, tune_alpha, walk_forward,
+    FEATURES_MEAN, LEAD, build_features, load_nbm, select_features, walk_forward,
 )
-from blend import DEFAULT_MODE, NBM_FEATURES, NBM_SIGMA, nbm_frame  # noqa: E402
+from blend import (  # noqa: E402
+    DEFAULT_INFLATE, DEFAULT_MODE, NBM_FEATURES, NBM_SIGMA,
+    blend_walk_forward,
+)
 
 GAMMA = "https://gamma-api.polymarket.com"
 EVENT_SLUG = "highest-temperature-in-nyc-on-{month}-{day}-{year}"
-MARKET_STATION = "LGA"          # what Polymarket actually settles on
+MARKET_STATION = "LGA"           # IEM id, for observations
+MARKET_STATION_ICAO = "KLGA"     # what Polymarket actually settles on
 MARKET_NETWORK = "NY_ASOS"
 
+# CLV state belongs to the market's station, not whatever was last selected.
+config.use_station(MARKET_STATION_ICAO)
 PRED_PATH = config.DATA_DIR / "clv_pred.parquet"
 LOG_PATH = config.DATA_DIR / "clv_log.parquet"
 
@@ -212,6 +214,7 @@ def market_rows(event: dict, target: date) -> tuple[list[dict], list[str]]:
 
 def klga_obs() -> pd.Series:
     """Reported KLGA daily maxima in F -- the quantity the market settles on."""
+    config.use_station(MARKET_STATION_ICAO)
     r = requests.get(config.IEM_DAILY_URL,
                      params={"station": MARKET_STATION, "network": MARKET_NETWORK,
                              "sdate": config.OBS_START.isoformat(),
@@ -225,81 +228,68 @@ def klga_obs() -> pd.Series:
     return df.set_index("local_date")["max_tmpf"].astype(float).sort_index()
 
 
-def blend_series() -> pd.DataFrame:
-    """KNYC blend mean and spread per day, from the existing pipeline."""
-    obs, fc_daily = load_daily(LEAD)
-    ec = build_features().join(obs.rename("obs"), how="inner").dropna(
-        subset=FEATURES_MEAN + ["obs"])
-    nbm = nbm_frame(obs)
-    feats = select_features(ec, ec.index[int(len(ec) * 0.6)])
+def components(station: str) -> pd.DataFrame:
+    """Per-day MOS and NBM-PP predictions for `station`, from its own cache.
+
+    Left joins on the target so a day whose observation does not exist yet -- the
+    live case -- survives and can still be predicted.
+    """
+    config.use_station(station)
+    obs, _ = load_daily(LEAD)
+    ec = build_features().join(obs.rename("obs"), how="left").dropna(subset=FEATURES_MEAN)
+    nbm = nbm_frame_live(obs)
+    feats = select_features(ec.dropna(subset=["obs"]), ec.index[int(len(ec) * 0.6)])
 
     mos = walk_forward(ec, ec.index, feats, "rolling")
     npp = walk_forward(nbm, nbm.index, NBM_FEATURES, "rolling",
                        sigma_features=NBM_SIGMA)
-    comp = pd.DataFrame({"mu_mos": mos["mu"], "sigma_mos": mos["sigma"]}).join(
+    comp = pd.DataFrame({"obs": mos["obs"], "mu_mos": mos["mu"],
+                         "sigma_mos": mos["sigma"]}).join(
         pd.DataFrame({"mu_nbm": npp["mu"], "sigma_nbm": npp["sigma"]}), how="inner")
 
-    # Inverse-variance weighting: the project default (CLAUDE.md rule 5a).
-    wa = 1.0 / comp["sigma_mos"] ** 2
-    wb = 1.0 / comp["sigma_nbm"] ** 2
-    w = wa / (wa + wb)
-    comp["blend_mu"] = w * comp["mu_mos"] + (1.0 - w) * comp["mu_nbm"]
-    comp["blend_sigma"] = np.sqrt(1.0 / (wa + wb))
-    return comp[["blend_mu", "blend_sigma"]]
+    iv_var = 1.0 / (1.0 / comp["sigma_mos"] ** 2 + 1.0 / comp["sigma_nbm"] ** 2)
+    comp["log_ivsigma"] = np.log(np.sqrt(iv_var))
+    doy = comp.index.dayofyear.values
+    comp["sin_doy"] = np.sin(2 * np.pi * doy / 365.25)
+    comp["cos_doy"] = np.cos(2 * np.pi * doy / 365.25)
+    return comp
 
 
-def predict_klga(target: date) -> tuple[float, float, int]:
-    """Walk-forward KLGA predictive mean and spread for one target day.
-
-    Fitted only on days whose observation was complete before the lead +1d
-    forecast for `target` was issued (cutoff target-2), like the rest of the
-    project. Returns (mu_F, sigma_F, n_train).
-    """
-    blend = blend_series()
-    obs = klga_obs()
-    df = blend.join(obs.rename("obs"), how="left")
+def nbm_frame_live(obs: pd.Series) -> pd.DataFrame:
+    """nbm_frame, but keeping days whose observation is not in yet."""
+    n = load_nbm()
+    if n.empty:
+        raise wxio.SourceError("no NBM rows cached; run ingest_nbm.py first")
+    df = pd.DataFrame({"nbm_tmax": n["mu"], "xnd": n["sigma"]}, index=n.index)
+    df = df.join(obs.rename("obs"), how="left").dropna(subset=["nbm_tmax", "xnd"])
     doy = df.index.dayofyear.values
     df["sin_doy"] = np.sin(2 * np.pi * doy / 365.25)
     df["cos_doy"] = np.cos(2 * np.pi * doy / 365.25)
-    df["log_blend_sigma"] = np.log(df["blend_sigma"].clip(lower=0.1))
+    df["log_xnd"] = np.log(df["xnd"].clip(lower=0.5))
+    return df.sort_index()
 
+
+def predict_market(target: date) -> tuple[float, float, int]:
+    """Predictive mean and spread for the market's own station, natively.
+
+    Until a native KLGA build existed this went through the KNYC blend plus a
+    statistical adaptation. Native is better on the settled quantity -- 1.33 CRPS
+    against 1.42 for the adaptation over the same 364 days -- because the
+    forecast fields are interpolated to LaGuardia rather than Central Park.
+    """
+    comp = components(MARKET_STATION_ICAO)
     D = pd.Timestamp(target)
-    if D not in df.index:
+    if D not in comp.index:
         raise wxio.SourceError(
-            f"no blend forecast for {target}; the backbone run for that day may "
-            f"not be cached yet (run ingest_forecast.py)")
+            f"no {MARKET_STATION_ICAO} forecast for {target}; the backbone run for "
+            f"that day may not be cached yet (run ingest_forecast.py)")
 
-    cutoff = D - pd.Timedelta(days=2)
-    train = df.loc[:cutoff].dropna(subset=ADAPT_FEATURES + ["obs"])
-    if len(train) < MIN_ADAPT_TRAIN:
-        raise wxio.SourceError(
-            f"only {len(train)} training days before {target}; need "
-            f"{MIN_ADAPT_TRAIN}")
-
-    X = train[ADAPT_FEATURES].to_numpy(float)
-    y = train["obs"].to_numpy(float)
-    Xte = df.loc[[D], ADAPT_FEATURES].to_numpy(float)
-    alpha = tune_alpha(X, y)
-    Xs, Xte_s = _standardize(X, Xte)
-    beta, b0 = ridge_fit(Xs, y, alpha)
-    mu = float((Xte_s @ beta + b0)[0])
-
-    resid = y - (Xs @ beta + b0)
-    Z = train[ADAPT_SIGMA].to_numpy(float)
-    Zte = df.loc[[D], ADAPT_SIGMA].to_numpy(float)
-    Zs, Zte_s = _standardize(Z, Zte)
-    gamma = fit_log_sigma(Zs, resid)
-    sigma = float(predict_sigma(gamma, Zte_s)[0])
-
-    # Same held-out spread scalar as the blend: fitted on the whole window it is
-    # identically 1, being redundant with the log-sigma intercept.
-    k = int(len(train) * (1.0 - HOLDOUT_FRAC))
-    if k >= 60 and len(train) - k >= 30:
-        Za, Zb = _standardize(Z[:k], Z[k:])
-        s_held = predict_sigma(fit_log_sigma(Za, resid[:k]), Zb)
-        sigma *= float(np.sqrt(np.mean((resid[k:] / s_held) ** 2)))
-
-    return mu, sigma, len(train)
+    out = blend_walk_forward(comp, pd.DatetimeIndex([D]), DEFAULT_MODE,
+                             inflate=DEFAULT_INFLATE)
+    if out.empty:
+        raise wxio.SourceError(f"not enough training history before {target}")
+    row = out.iloc[0]
+    return float(row["mu"]), float(row["sigma"]), int(row["n_train"])
 
 
 def cmd_predict(args) -> None:
@@ -314,13 +304,14 @@ def cmd_predict(args) -> None:
     rows = []
     for t in targets:
         try:
-            mu, sigma, n = predict_klga(t)
+            mu, sigma, n = predict_market(t)
         except wxio.SourceError as exc:
             print(f"  {t}: not yet available -- {str(exc)[:90]}")
             continue
         rows.append({"target_date": pd.Timestamp(t), "mu_f": mu, "sigma_f": sigma,
                      "n_train": n, "computed_at": utcnow()})
-        print(f"  {t}: KLGA mu {mu:.1f} F, sigma {sigma:.2f} F  (n_train={n})")
+        print(f"  {t}: {MARKET_STATION_ICAO} mu {mu:.1f} F, sigma {sigma:.2f} F  "
+              f"(n_train={n}, native)")
 
     if not rows:
         # A scheduled run that finds nothing new is normal, not a failure.

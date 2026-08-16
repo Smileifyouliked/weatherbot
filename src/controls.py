@@ -55,9 +55,11 @@ def mae_of(df: pd.DataFrame) -> float:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    config.add_station_arg(ap)
     ap.add_argument("--months", type=int, default=12)
     ap.add_argument("--seeds", type=int, default=5)
     args = ap.parse_args()
+    config.use_station(args.station)
 
     obs, fc_daily = load_daily(LEAD)
     feats = build_features()

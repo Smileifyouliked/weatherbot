@@ -162,6 +162,7 @@ def cached_cycles() -> set[pd.Timestamp]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    config.add_station_arg(ap)
     ap.add_argument("--start", type=date.fromisoformat,
                     default=date(2025, 8, 12))
     ap.add_argument("--end", type=date.fromisoformat,
@@ -170,6 +171,7 @@ def main() -> None:
     ap.add_argument("--refresh", action="store_true",
                     help="refetch cycles already cached (use after a parser fix)")
     args = ap.parse_args()
+    config.use_station(args.station)
 
     cycles = []
     day = args.start

@@ -379,9 +379,11 @@ def check_no_leakage(data: pd.DataFrame, targets: pd.DatetimeIndex,
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    config.add_station_arg(ap)
     ap.add_argument("--months", type=int, default=12)
     ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
+    config.use_station(args.station)
 
     obs, fc_daily = load_daily(LEAD)
     feats = build_features()

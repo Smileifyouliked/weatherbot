@@ -128,10 +128,12 @@ def fetch_official_daily(start: date, end: date) -> pd.DataFrame:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    config.add_station_arg(ap)
     ap.add_argument("--start", type=date.fromisoformat, default=config.OBS_START)
     ap.add_argument("--end", type=date.fromisoformat,
                     default=date.today() - timedelta(days=1))
     args = ap.parse_args()
+    config.use_station(args.station)
 
     print(f"ASOS ingestion: {config.STATION_ICAO} ({config.STATION_IEM_ID})")
     raw = to_raw(fetch_asos(args.start, args.end))
