@@ -24,7 +24,8 @@ CRPS on the settled quantity against 1.33 for native over the same 364 days.
 WHEN A SNAPSHOT IS WORTH TAKING
 -------------------------------
 Prices are only logged for a target day while that day's maximum is still
-genuinely uncertain, i.e. before PEAK_LOCAL_HOUR local time. Past that the
+genuinely uncertain, i.e. before that season's cutoff in PEAK_LOCAL_HOUR_BY_SEASON
+(DJF 15:00, SON 15:30, MAM and JJA 16:00) local time. Past that the
 market has effectively seen the answer and quotes ~0 or ~1; recording those
 prices measures nothing and contaminates the CLV comparison with
 trivially-known outcomes. Rows captured before the guard existed are kept as a
@@ -129,6 +130,12 @@ WINDOW_OPEN_HOURS_AFTER_00Z = 7.46
 
 def peak_hour_for(target: date) -> float:
     return PEAK_LOCAL_HOUR_BY_SEASON[SEASON_OF_MONTH[target.month]]
+
+
+def cutoff_summary() -> str:
+    """The seasonal cutoffs as one short string, for messages."""
+    return ", ".join(f"{s} {int(h)}:{round(h % 1 * 60):02d}"
+                     for s, h in PEAK_LOCAL_HOUR_BY_SEASON.items())
 
 
 def c_to_f(c):
@@ -507,6 +514,15 @@ def cmd_log(args) -> None:
 # --- resolution --------------------------------------------------------------
 
 def cmd_resolve(args) -> None:
+    """Attach outcomes, but only for local days that have actually ended.
+
+    IEM's daily endpoint serves a row for the current day carrying the maximum
+    reported *so far*. Treating that as settled scores the forecast against a
+    partial maximum -- at 07:00 local it is close to the overnight low -- and
+    marks the wrong bucket correct. Because outcomes were only ever filled where
+    null, such a row was never revisited: one premature resolve corrupted that
+    day's record permanently.
+    """
     if not LOG_PATH.exists():
         raise wxio.SourceError("no log to resolve")
     log = apply_exclusions(pd.read_parquet(LOG_PATH))
@@ -516,16 +532,39 @@ def cmd_resolve(args) -> None:
         log["outcome"] = np.nan
         log["observed_f"] = np.nan
 
-    need = log["outcome"].isna()
-    resolved = 0
-    for i in log.index[need]:
+    # A target day is settled once the station's local day has ended.
+    today_local = (pd.Timestamp(datetime.now(timezone.utc))
+                   .tz_convert(config.STATIONS[MARKET_STATION_ICAO].tz).date())
+    settled = pd.to_datetime(log["target_date"]) < pd.Timestamp(today_local)
+
+    # Clear anything attached before its day ended, so it resolves properly once
+    # the day closes.
+    premature = log["outcome"].notna() & ~settled
+    if premature.any():
+        log.loc[premature, "outcome"] = np.nan
+        log.loc[premature, "observed_f"] = np.nan
+        print(f"  cleared {int(premature.sum())} outcome(s) attached before the "
+              f"local day had ended")
+
+    # Recompute every settled row rather than only the null ones. An outcome is
+    # a pure function of the reported daily max, so this is idempotent -- and it
+    # is what repairs a day that was resolved early under the old rule and has
+    # since closed, whose stored outcome would otherwise never be revisited.
+    pending = int((log["outcome"].isna() & ~settled).sum())
+    resolved = corrected = 0
+    for i in log.index[settled]:
         t = pd.Timestamp(log.at[i, "target_date"])
         if t not in obs.index:
             continue
         y = float(obs.loc[t])
+        was = log.at[i, "observed_f"]
+        outcome = float(log.at[i, "lo_f"] <= y < log.at[i, "hi_f"])
+        if pd.isna(was):
+            resolved += 1
+        elif float(was) != y:
+            corrected += 1
         log.at[i, "observed_f"] = y
-        log.at[i, "outcome"] = float(log.at[i, "lo_f"] <= y < log.at[i, "hi_f"])
-        resolved += 1
+        log.at[i, "outcome"] = outcome
 
     log.to_parquet(LOG_PATH, index=False)
     done = int(log["outcome"].notna().sum())
@@ -533,6 +572,11 @@ def cmd_resolve(args) -> None:
     if resolved:
         days = log.loc[log["outcome"].notna(), "target_date"].nunique()
         print(f"  covering {days} target days")
+    if corrected:
+        print(f"  corrected {corrected} row(s) whose stored observation disagreed "
+              f"with the reported daily max")
+    if pending:
+        print(f"  {pending} row(s) awaiting the end of their local day")
 
 
 # --- scoring -----------------------------------------------------------------
@@ -570,7 +614,8 @@ def cmd_score(args) -> None:
         df = df[~df["excluded"]]
         if df.empty:
             raise wxio.SourceError(
-                f"every resolved row was logged after {PEAK_LOCAL_HOUR}:00 local on "
+                f"every resolved row was logged after its season's cutoff "
+                f"({cutoff_summary()}) local on "
                 f"its target day, when the maximum has usually already happened and "
                 f"the market prices a near-known outcome. Scoring those would "
                 f"measure nothing. Use --include-late to override.")
@@ -601,8 +646,8 @@ def cmd_score(args) -> None:
         print(f"dropped       : {dropped} resolved rows with a one-sided book "
               f"(no mid to score against)")
     if late:
-        print(f"excluded      : {late} rows logged after {PEAK_LOCAL_HOUR}:00 local, "
-              f"when the max has usually already happened")
+        print(f"excluded      : {late} rows logged after the season's cutoff "
+              f"({cutoff_summary()}) local, when the max has usually happened")
     print(f"log window    : {df['logged_at'].min():%Y-%m-%d %H:%M} -> "
           f"{df['logged_at'].max():%Y-%m-%d %H:%M} UTC")
     print(f"snapshots/day : {len(df) / max(df['target_date'].nunique(), 1) / 11:.1f}")
