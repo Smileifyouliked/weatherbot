@@ -218,6 +218,14 @@ def walk_forward(data: pd.DataFrame, targets: pd.DatetimeIndex,
         train = data.loc[:cutoff]
         if window == "rolling":
             train = train.loc[train.index > cutoff - timedelta(days=ROLLING_DAYS)]
+        # A training row without an observation has no target to fit against.
+        # Left in, its NaN propagates through the ridge solve and every
+        # coefficient comes back NaN, so the forecast is NaN with no error
+        # raised anywhere. Historically the cache was always observed up to
+        # D-2 and this never bit; it bites the moment observations lag more
+        # than two days behind the forecast, which is what happens when the
+        # unattended job refreshes forecasts but not observations.
+        train = train[train["obs"].notna()]
         if len(train) < MIN_TRAIN_ROWS or D not in data.index:
             continue
 

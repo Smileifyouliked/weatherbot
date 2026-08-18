@@ -391,7 +391,19 @@ def predict_market(target: date) -> tuple[float, float, int]:
     if out.empty:
         raise wxio.SourceError(f"not enough training history before {target}")
     row = out.iloc[0]
-    return float(row["mu"]), float(row["sigma"]), int(row["n_train"])
+    mu, sigma = float(row["mu"]), float(row["sigma"])
+
+    # A non-finite forecast is a failure, not a forecast. Returned quietly it
+    # got cached, logged against 297 rows of real market prices, and only
+    # surfaced days later as a NaN in the middle of a Brier score. Hard rule 7:
+    # stop and report rather than pass something unusable downstream.
+    if not np.isfinite(mu) or not np.isfinite(sigma) or sigma <= 0:
+        raise wxio.SourceError(
+            f"blend produced a non-finite forecast for {target} "
+            f"(mu={mu}, sigma={sigma}, n_train={int(row['n_train'])}). One of the "
+            f"MOS or NBM inputs for that day is missing or degenerate; inspect "
+            f"components('{MARKET_STATION_ICAO}').loc['{target}'].")
+    return mu, sigma, int(row["n_train"])
 
 
 def cmd_predict(args) -> None:
@@ -465,6 +477,14 @@ def cmd_log(args) -> None:
 
         mu = float(pred.loc[ts, "mu_f"])
         sigma = float(pred.loc[ts, "sigma_f"])
+        # Never log a bucket we cannot price. A cached NaN forecast otherwise
+        # writes rows carrying a market price and no probability, which are
+        # indistinguishable from real ones until they turn a Brier score into
+        # nan. Skipping costs a day of prices; logging costs the day's record.
+        if not np.isfinite(mu) or not np.isfinite(sigma) or sigma <= 0:
+            print(f"  {t}: cached forecast is not finite (mu={mu}, sigma={sigma}) "
+                  f"-- not logged; re-run predict once the inputs are back")
+            continue
 
         determined, why = already_determined(t, mu, sigma)
         if determined:
@@ -621,6 +641,24 @@ def cmd_score(args) -> None:
         raise wxio.SourceError("no resolved rows yet; run 'resolve' after a market settles")
 
     resolved_all = log[log["outcome"].notna()]
+
+    # Rows with no probability cannot be scored: a Brier over them is nan, and a
+    # nan printed beside the market's number reads as "we did badly" rather than
+    # "this was never measured". Drop them and say how many.
+    unpriced = int(resolved_all["our_p"].isna().sum())
+    if unpriced:
+        days = sorted(resolved_all.loc[resolved_all["our_p"].isna(), "target_date"]
+                      .dt.date.unique())
+        print(f"WARNING: {unpriced} resolved row(s) carry no forecast and are "
+              f"excluded from every figure below.")
+        print(f"         affected day(s): "
+              f"{', '.join(str(d) for d in days[:6])}"
+              f"{' ...' if len(days) > 6 else ''}")
+        print("         those days were logged against a forecast that failed; "
+              "they are lost, not recoverable.")
+        resolved_all = resolved_all[resolved_all["our_p"].notna()]
+        if resolved_all.empty:
+            raise wxio.SourceError("no resolved row carries a usable forecast")
 
     # Ahead of every mid-dependent abort below: the P&L fills at ask and bid and
     # needs no mid at all, so a log of entirely one-sided books -- the normal
@@ -908,7 +946,10 @@ def pnl_report(log: pd.DataFrame, edge: float, stake: float,
     """
     validate_pnl_args(edge, stake)
 
-    df = log[log["outcome"].notna()].copy()
+    # An unpriced row has no edge to measure against the quote, so it can never
+    # produce a trade -- but it must not count toward the day threshold either,
+    # or a run of failed forecasts would unlock the P&L without adding evidence.
+    df = log[log["outcome"].notna() & log["our_p"].notna()].copy()
     if not include_late:
         df = df[~df["excluded"]]
     if df.empty:
