@@ -91,8 +91,10 @@ class Stage:
     def __init__(self) -> None:
         self.failed: list[str] = []
         self.noop: list[str] = []
+        self.total = 0
 
     def run(self, name: str, fn, tolerated: tuple[type, ...] = ()) -> object:
+        self.total += 1
         LOG.info("=== %s", name)
         try:
             result = fn()
@@ -185,8 +187,27 @@ def main() -> int:
                     "--end", today.isoformat()]
         ingest_nbm.main()
 
+    # Observations. Without this the forecast side advances daily while the
+    # training target stays frozen at whatever the cache shipped with, and the
+    # gap is invisible: `resolve` reads observations live from a different
+    # endpoint, so scoring keeps working while the model goes stale.
+    #
+    # Worse than stale. walk_forward trains on rows up to D-2, so once the
+    # observation lag passes two days every fit sees a row with no target and
+    # returns NaN. That is not a slow degradation, it is a hard stop.
+    #
+    # A fortnight's window: enough to close a gap left by a few failed runs,
+    # small enough to stay a cheap incremental pull.
+    def pull_asos():
+        import ingest_asos
+        sys.argv = ["ingest_asos", "--station", market.icao,
+                    "--start", (today - timedelta(days=14)).isoformat(),
+                    "--end", (today - timedelta(days=1)).isoformat()]
+        ingest_asos.main()
+
     st.run("pull ECMWF 00Z runs", pull_ecmwf, tolerated)
     st.run("pull NBM bulletins", pull_nbm, tolerated)
+    st.run("pull ASOS observations", pull_asos, tolerated)
 
     # 2. Blend forecast -> KLGA predictive distribution, cached for the day.
     def predict():
@@ -209,7 +230,8 @@ def main() -> int:
 
     elapsed = (datetime.now(timezone.utc) - started).total_seconds()
     LOG.info("run_daily done in %.0fs  |  %d ok, %d no-op, %d failed",
-             elapsed, 5 - len(st.failed) - len(st.noop), len(st.noop), len(st.failed))
+             elapsed, st.total - len(st.failed) - len(st.noop),
+             len(st.noop), len(st.failed))
     if st.noop:
         LOG.info("no-op stages (upstream not ready): %s", ", ".join(st.noop))
     if st.failed:

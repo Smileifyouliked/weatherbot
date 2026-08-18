@@ -239,6 +239,14 @@ def _dedup_daily(daily: pd.DataFrame) -> pd.DataFrame:
             keyed[col + "_k"] = pd.to_datetime(keyed[col], utc=True).fillna(sentinel_time)
         elif col == "member":
             keyed[col + "_k"] = pd.to_numeric(keyed[col], errors="coerce").fillna(-1.0)
+        elif col == "local_date":
+            # Normalised here, not left to the schema pass below, which runs
+            # after this. Rows read back from parquet carry a Timestamp while a
+            # freshly fetched frame carries a datetime.date; compared as objects
+            # they are unequal, so a re-pull of days already on disk appends a
+            # second copy of each instead of replacing it. Downstream that shows
+            # up as a duplicated index and `float(Series)`, days later.
+            keyed[col + "_k"] = pd.to_datetime(keyed[col])
         else:
             keyed[col + "_k"] = keyed[col].astype(object).where(keyed[col].notna(), "\x00")
     kcols = [c + "_k" for c in DAILY_KEY]
