@@ -26,11 +26,17 @@ import argparse
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 
 import config
 import wxio
+
+# A run still absent from the archive after this long is a hole that will not
+# fill. Shorter than this and it is simply not published yet -- today's run is
+# absent for the first several hours by definition.
+GAP_SETTLED_DAYS = 7
 
 
 def _hourly_frame(payload: dict, key: str) -> pd.DataFrame:
@@ -111,17 +117,61 @@ def fetch_run(run: datetime) -> pd.DataFrame | None:
     return pd.concat(frames, ignore_index=True)
 
 
-def ingest_backbone(start: date, end: date, limit: int | None) -> None:
+def gap_path() -> Path:
+    return config.DATA_DIR / "archive_gaps.parquet"
+
+
+def load_gaps() -> dict[pd.Timestamp, pd.Timestamp]:
+    """Runs the server has said it does not have, and when it last said so."""
+    p = gap_path()
+    if not p.exists():
+        return {}
+    df = pd.read_parquet(p)
+    return dict(zip(pd.to_datetime(df["run"], utc=True),
+                    pd.to_datetime(df["last_checked"], utc=True)))
+
+
+def save_gaps(gaps: dict[pd.Timestamp, pd.Timestamp]) -> None:
+    if not gaps:
+        return
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"run": list(gaps), "last_checked": list(gaps.values())}) \
+        .sort_values("run").to_parquet(gap_path(), index=False)
+
+
+def settled_gap(run: datetime, now: pd.Timestamp) -> bool:
+    """Whether a known-absent run is old enough to stop asking about.
+
+    A run missing from the archive an hour after issue is simply not published
+    yet and must stay retryable -- that is the normal state of today's run, and
+    blacklisting it would mean never fetching the only run that matters. A run
+    still missing after GAP_SETTLED_DAYS is a hole in the archive that will not
+    fill, and re-asking three times per cron tick, forever, spends the daily API
+    budget on runs that do not exist.
+    """
+    return (now - pd.to_datetime(run, utc=True)) > pd.Timedelta(days=GAP_SETTLED_DAYS)
+
+
+def ingest_backbone(start: date, end: date, limit: int | None,
+                    retry_gaps: bool = False) -> None:
     wanted = run_times(start, end)
     have = wxio.cached_issue_times("single_runs", config.BACKBONE_MODEL,
                                    config.FORECAST_VARIABLES)
     todo = [r for r in wanted if pd.Timestamp(r) not in have]
     cached = len(wanted) - len(todo)
+
+    known_gaps = {} if retry_gaps else load_gaps()
+    now = pd.Timestamp.now(tz="UTC")
+    skipped = [r for r in todo
+               if pd.to_datetime(r, utc=True) in known_gaps and settled_gap(r, now)]
+    todo = [r for r in todo if r not in set(skipped)]
+
     if limit:
         todo = todo[:limit]
 
     print(f"backbone {config.BACKBONE_MODEL}: {len(wanted)} runs in range, "
           f"{cached} already cached, {len(todo)} to fetch"
+          + (f", {len(skipped)} known archive gaps skipped" if skipped else "")
           + (f" (limited to {limit})" if limit else ""))
 
     # Individual archive reads are slow (often 20-60s for older dates), so these
@@ -166,12 +216,27 @@ def ingest_backbone(start: date, end: date, limit: int | None) -> None:
                     batch = []
                     print(f"    flushed -> +{added} rows total", flush=True)
 
+    # Recorded so a settled hole stops being re-asked on every cron tick. Only
+    # gaps are recorded, never transport failures: an unreachable run may well
+    # be there, and writing it off would lose real data.
+    if gaps or skipped:
+        known_gaps.update({pd.to_datetime(g, utc=True): now for g in gaps})
+        for g in skipped:
+            known_gaps.setdefault(pd.to_datetime(g, utc=True), now)
+        save_gaps(known_gaps)
+
     if gaps:
+        settled = [g for g in gaps if settled_gap(g, now)]
         print(f"  archive gaps -- server reported {len(gaps)} runs not available:")
         for g in gaps[:10]:
-            print(f"    {g:%Y-%m-%dT%H:%M}Z")
+            print(f"    {g:%Y-%m-%dT%H:%M}Z"
+                  + ("" if settled_gap(g, now) else "  (recent -- will retry)"))
         if len(gaps) > 10:
             print(f"    ... and {len(gaps) - 10} more")
+        if settled:
+            print(f"  {len(settled)} of these are older than {GAP_SETTLED_DAYS}d "
+                  f"and will be skipped from now on ({gap_path().name}); "
+                  f"--retry-gaps forces a recheck")
 
     if unreachable:
         print(f"  unreachable -- {len(unreachable)} runs failed every attempt:")
@@ -265,13 +330,15 @@ def main() -> None:
     ap.add_argument("--timeout", type=int, default=config.HTTP_TIMEOUT)
     ap.add_argument("--skip-backbone", action="store_true")
     ap.add_argument("--skip-ensemble", action="store_true")
+    ap.add_argument("--retry-gaps", action="store_true",
+                    help="re-attempt runs previously reported absent")
     args = ap.parse_args()
     config.use_station(args.station)
     config.MAX_WORKERS = args.workers
     config.HTTP_TIMEOUT = args.timeout
 
     if not args.skip_backbone:
-        ingest_backbone(args.start, args.end, args.limit)
+        ingest_backbone(args.start, args.end, args.limit, args.retry_gaps)
     if not args.skip_ensemble:
         ingest_ensemble()
 
