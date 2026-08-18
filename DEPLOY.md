@@ -295,6 +295,40 @@ With one resolved day the eleven buckets within it are near-perfectly dependent,
 so the effective sample size is about one, not eleven. Expect several weeks
 before the Brier comparison and CLV mean anything.
 
+### The Open-Meteo daily request budget
+
+The Single Runs archive has a daily request limit, and a `*/30` cron makes 34
+passes a day against it. The thing that used to blow the budget was runs the
+archive simply does not have: six holes in the ECMWF record were re-attempted on
+every pass, three attempts each, forever — about 600 requests a day spent asking
+for data that does not exist. On the live host that produced real `429 Daily API
+request limit exceeded` responses, which is worse than wasteful: once the budget
+is gone, the run that *does* matter cannot be fetched either.
+
+Runs the server reports as absent are now recorded in `data/<ICAO>/archive_gaps.parquet`
+and skipped once they are more than `GAP_SETTLED_DAYS` (7) old. Newer absences
+are always retried, because today's run is absent by definition for the first
+several hours and blacklisting it would mean never fetching it.
+
+Only *gaps* are recorded, never transport failures. A timeout or a 429 may well
+be hiding a run that is really there, and writing those off would lose real data.
+
+To force a recheck of everything:
+
+```bash
+sudo -u weatherbot -H bash -c 'cd /opt/weatherbot/app && \
+  .venv/bin/python ingest_forecast.py --station KLGA --skip-ensemble --retry-gaps'
+```
+
+Watch for budget exhaustion with:
+
+```bash
+sudo grep -icE "429|request limit" /opt/weatherbot/app/logs/cron.log
+```
+
+Anything above zero means the quota is being hit and the cause needs finding —
+it should now be rare.
+
 ## 10. Updating
 
 ```bash
